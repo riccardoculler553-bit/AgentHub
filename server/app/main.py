@@ -27,9 +27,16 @@ from app.task.monitor import TaskMonitor
 from app.websocket.heartbeat import HeartbeatMonitor
 from app.websocket.hub import ConnectionHub
 
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_DIR / "server.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 

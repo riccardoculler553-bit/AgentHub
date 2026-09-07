@@ -166,7 +166,11 @@ class YingdaoExecutor(Executor):
                 f"影刀启动未确认（重试 {attempts} 次），请检查该电脑影刀/日志配置",
             )
 
-        # 5) wait for exit (default) or return right after confirmation
+        # 5) wait for task end (default) or return right after confirmation.
+        # Completion signal is the LOG's end marker when available: the
+        # ShadowBot.exe process may exit immediately (launcher pattern) while
+        # the robot engine keeps running, or stay open after the task ended.
+        # Process exit is only trusted when no log can be read at all.
         if not self.wait_for_exit:
             return {
                 "process_started": True,
@@ -178,27 +182,49 @@ class YingdaoExecutor(Executor):
         await progress(30, "影刀执行中")
         started = time.monotonic()
         deadline = started + timeout
+        use_log = self.check_mode == "log"
+        our_start_time = None
+        if use_log:
+            tail_now = busy_check.read_log_tail(self.log_dir)
+            if tail_now is not None:
+                our_start_time = busy_check.scan_markers(tail_now)[2]
+
+        end_source = None
         while True:
             if cancel.is_set():
                 busy_check.terminate_robot(pid)
                 raise ExecutionError("EXECUTOR_CANCELLED", "任务已取消")
-            if process.poll() is not None:
-                break
             if time.monotonic() > deadline:
                 busy_check.terminate_robot(pid)
                 raise ExecutionError("EXECUTOR_TIMEOUT", f"影刀执行超过 {timeout}s，已终止")
+
+            if use_log:
+                tail = busy_check.read_log_tail(self.log_dir)
+                if tail is not None:
+                    # log is the source of truth; ignore process lifetime
+                    if busy_check.task_end_seen(self.log_dir, our_start_time):
+                        end_source = "log"
+                        break
+                elif process.poll() is not None:
+                    # no log file at all -> fall back to process exit
+                    end_source = "process"
+                    break
+            elif process.poll() is not None:
+                end_source = "process"
+                break
             await asyncio.sleep(1)
 
         duration = round(time.monotonic() - started, 1)
-        code = process.returncode
+        code = process.poll()
         result = {
             "process_started": True,
             "launch_confirmed": confirmed,
             "exit_code": code,
+            "end_source": end_source,
             "duration": duration,
             "robot_uuid": self.robot_uuid,
         }
-        if code != 0:
+        if end_source == "process" and code not in (0, None):
             raise ExecutionError("EXECUTOR_FAILED", f"影刀进程退出码 {code}")
         result["message"] = "审单执行完成"
         await progress(100, "影刀执行完成")

@@ -61,16 +61,12 @@ def test_registry_reloads_custom_config(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr(settings, "agent_tools_config", str(config_file))
-    try:
-        tool_registry.reload()
-        tool = tool_registry.by_command("yingdao.pack")
-        assert tool is not None
-        assert tool.devices == ("仓库电脑01",)
-        assert analyze("打包", []) is not None
-        assert analyze("审单", []) is None  # custom config replaces defaults
-    finally:
-        monkeypatch.setattr(settings, "agent_tools_config", None)
-        tool_registry.reload()
+    tool_registry.reload()
+    tool = tool_registry.by_command("yingdao.pack")
+    assert tool is not None
+    assert tool.devices == ("仓库电脑01",)
+    assert analyze("打包", []) is not None
+    assert analyze("审单", []) is None  # custom config replaces defaults
 
 
 def test_registry_falls_back_to_defaults_on_bad_config(tmp_path, monkeypatch):
@@ -79,9 +75,5 @@ def test_registry_falls_back_to_defaults_on_bad_config(tmp_path, monkeypatch):
     config_file = tmp_path / "broken.json"
     config_file.write_text("{not json", encoding="utf-8")
     monkeypatch.setattr(settings, "agent_tools_config", str(config_file))
-    try:
-        tool_registry.reload()
-        assert tool_registry.by_command("yingdao.audit") is not None
-    finally:
-        monkeypatch.setattr(settings, "agent_tools_config", None)
-        tool_registry.reload()
+    tool_registry.reload()
+    assert tool_registry.by_command("yingdao.audit") is not None

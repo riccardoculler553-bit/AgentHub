@@ -1,69 +1,111 @@
 """DingTalk Stream Mode client (PDF §5/§88).
 
-Runs the official dingtalk-stream long connection; robot callbacks are parsed
-into IncomingMessage and handed to the MvpAgentService. Started from the app
-lifespan when DINGTALK_CLIENT_ID/SECRET are configured; the dependency is
-optional so the server still boots without it.
+Raw long-connection protocol (ported from the proven dingtalk-xbot-audit
+implementation, replacing the official dingtalk-stream SDK whose gateway
+endpoint stopped delivering group @ callbacks for this app):
+
+1. POST /v1.0/gateway/connections/open -> {endpoint, ticket}
+2. WebSocket connect to endpoint?ticket=<ticket>
+3. Frames: SYSTEM(ping/disconnect), EVENT, CALLBACK
+4. ACK every frame with {code, headers{messageId, contentType}}
+5. CALLBACK frames with the chatbot topic are parsed into IncomingMessage
+   and handed to the MvpAgentService.
+
+Started from the app lifespan when DINGTALK_CLIENT_ID/SECRET are configured;
+the dependency is optional so the server still boots without it.
 """
 
 import asyncio
+import json
 import logging
+import socket
+import time
+import urllib.request
+from urllib.parse import quote_plus
+
+import websockets
 
 from app.core.config import settings
 from app.integrations.dingtalk.models import IncomingMessage
 
 logger = logging.getLogger(__name__)
 
-
-class AgentHubBotHandler:
-    """Adapter glue: dingtalk-stream callback -> IncomingMessage -> MVP agent.
-
-    Kept as a mixin so the module imports even when dingtalk_stream is not
-    installed (tests / bare deployments)."""
-
-    async def handle_payload(self, data: dict, on_message) -> None:
-        incoming = parse_and_filter(data)
-        if incoming is None:
-            return
-        await on_message(incoming)
+BOT_MESSAGE_TOPIC = "/v1.0/im/bot/messages/get"
+OPENAPI_ENDPOINT = "https://api.dingtalk.com"
 
 
-def parse_and_filter(data: dict) -> IncomingMessage | None:
+def _local_ip() -> str:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except Exception:
+        return ""
+    finally:
+        sock.close()
+
+
+def _register_connection(client_id: str, client_secret: str) -> tuple[str, str]:
+    """Step 1: ask DingTalk for a WebSocket endpoint and one-time ticket."""
+    payload = {
+        "clientId": client_id,
+        "clientSecret": client_secret,
+        "subscriptions": [{"type": "CALLBACK", "topic": BOT_MESSAGE_TOPIC}],
+        "ua": "agenthub-stream/1.0",
+        "localIp": _local_ip(),
+    }
+    req = urllib.request.Request(
+        f"{OPENAPI_ENDPOINT}/v1.0/gateway/connections/open",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    endpoint = (data or {}).get("endpoint") or ""
+    ticket = (data or {}).get("ticket") or ""
+    if not endpoint or not ticket:
+        raise RuntimeError(f"open connection response missing endpoint/ticket: {data}")
+    return endpoint, ticket
+
+
+def _parse_frame(frame: dict) -> IncomingMessage | None:
     from app.integrations.dingtalk.parser import parse_incoming
 
+    if frame.get("type") != "CALLBACK":
+        return None
+    topic = (frame.get("headers") or {}).get("topic")
+    if topic != BOT_MESSAGE_TOPIC:
+        return None
+    data = frame.get("data")
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            logger.warning("dingtalk callback data is not json: %.160s", data)
+            return None
+    if not isinstance(data, dict):
+        return None
     return parse_incoming(data)
 
 
-def build_bot_handler(service):
-    """Create the dingtalk_stream chatbot handler bound to `service`."""
-    import dingtalk_stream
+class GroupThrottle:
+    """At most one trigger per conversation within a rolling window
+    (参考 dingtalk-xbot-audit MessageHandler.GroupThrottle)."""
 
-    throttle = GroupThrottle(settings.dingtalk_throttle_seconds)
+    def __init__(self, seconds: int) -> None:
+        self.seconds = max(0, seconds)
+        self._last: dict[str, float] = {}
 
-    class Handler(dingtalk_stream.ChatbotHandler):
-        async def process(self, callback: dingtalk_stream.CallbackMessage):
-            incoming = parse_and_filter(callback.data)
-            if incoming is None:
-                return dingtalk_stream.AckMessage.STATUS_OK, "ignored"
-            if not throttle.allow(incoming.conversation_id):
-                logger.info("dingtalk message throttled: conv=%s", incoming.conversation_id)
-                await _send_throttled_notice(service, incoming)
-                return dingtalk_stream.AckMessage.STATUS_OK, "throttled"
-            try:
-                service.handle_message(
-                    text=incoming.text,
-                    channel=incoming.channel,
-                    message_id=incoming.message_id,
-                    conversation_id=incoming.conversation_id,
-                    sender_id=incoming.sender_id,
-                    sender_name=incoming.sender_name,
-                    reply_webhook=incoming.reply_webhook,
-                )
-            except Exception:
-                logger.exception("failed to enqueue dingtalk message %s", incoming.message_id)
-            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
-
-    return Handler()
+    def allow(self, conversation_id: str) -> bool:
+        if self.seconds <= 0:
+            return True
+        now = time.monotonic()
+        last = self._last.get(conversation_id)
+        if last is not None and now - last < self.seconds:
+            return False
+        self._last[conversation_id] = now
+        return True
 
 
 async def _send_throttled_notice(service, incoming: IncomingMessage) -> None:
@@ -80,56 +122,91 @@ async def _send_throttled_notice(service, incoming: IncomingMessage) -> None:
         logger.exception("failed to send throttled notice")
 
 
-class GroupThrottle:
-    """At most one trigger per conversation within a rolling window
-    (参考 dingtalk-xbot-audit MessageHandler.GroupThrottle)."""
+async def _handle_frame(ws, frame: dict, service, throttle: GroupThrottle) -> None:
+    headers = frame.get("headers") or {}
+    logger.info(
+        "dingtalk frame: type=%s topic=%s messageId=%s",
+        frame.get("type"),
+        headers.get("topic"),
+        headers.get("messageId"),
+    )
+    # ACK every frame first (protocol requirement, mirrors the reference impl).
+    ack = {
+        "code": 200,
+        "message": "OK",
+        "headers": {
+            "contentType": "application/json",
+            "messageId": headers.get("messageId"),
+        },
+    }
+    await ws.send(json.dumps(ack))
 
-    def __init__(self, seconds: int) -> None:
-        self.seconds = max(0, seconds)
-        self._last: dict[str, float] = {}
+    incoming = _parse_frame(frame)
+    if incoming is None:
+        return
+    logger.info(
+        "dingtalk message: conv=%s sender=%s(%s) msg_id=%s text=%r",
+        incoming.conversation_id,
+        incoming.sender_name,
+        incoming.sender_id,
+        incoming.message_id,
+        incoming.text,
+    )
+    if not throttle.allow(incoming.conversation_id):
+        logger.info("dingtalk message throttled: conv=%s", incoming.conversation_id)
+        await _send_throttled_notice(service, incoming)
+        return
+    try:
+        service.handle_message(
+            text=incoming.text,
+            channel=incoming.channel,
+            message_id=incoming.message_id,
+            conversation_id=incoming.conversation_id,
+            sender_id=incoming.sender_id,
+            sender_name=incoming.sender_name,
+            reply_webhook=incoming.reply_webhook,
+        )
+    except Exception:
+        logger.exception("failed to enqueue dingtalk message %s", incoming.message_id)
 
-    def allow(self, conversation_id: str) -> bool:
-        if self.seconds <= 0:
-            return True
-        import time
 
-        now = time.monotonic()
-        last = self._last.get(conversation_id)
-        if last is not None and now - last < self.seconds:
-            return False
-        self._last[conversation_id] = now
-        return True
+async def _stream_loop(service) -> None:
+    credential_error_streak = 0
+    while True:
+        try:
+            endpoint, ticket = await asyncio.to_thread(
+                _register_connection,
+                settings.dingtalk_client_id,
+                settings.dingtalk_client_secret,
+            )
+            logger.info("DingTalk Stream client starting (robot=%s)", settings.dingtalk_robot_code)
+            logger.info("dingtalk open connection, endpoint=%s", endpoint)
+            throttle = GroupThrottle(settings.dingtalk_throttle_seconds)
+            async with websockets.connect(
+                f"{endpoint}?ticket={quote_plus(ticket)}", max_size=4 * 1024 * 1024
+            ) as ws:
+                logger.info("DingTalk connected via %s", endpoint)
+                credential_error_streak = 0
+                async for raw in ws:
+                    try:
+                        frame = json.loads(raw)
+                    except json.JSONDecodeError:
+                        logger.warning("invalid frame from DingTalk gateway")
+                        continue
+                    await _handle_frame(ws, frame, service, throttle)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            credential_error_streak += 1
+            delay = 10 if credential_error_streak < 3 else 60
+            logger.exception("DingTalk Stream client crashed; restarting in %ss", delay)
+            await asyncio.sleep(delay)
 
 
 async def start_dingtalk_bot(hub, service) -> "asyncio.Task | None":
     """Start the Stream client as a background task. Returns None when the
-    integration is not configured or the SDK is unavailable."""
+    integration is not configured."""
     if not (settings.dingtalk_client_id and settings.dingtalk_client_secret):
         logger.info("DingTalk integration disabled (no DINGTALK_CLIENT_ID/SECRET)")
         return None
-    try:
-        import dingtalk_stream
-    except ImportError:
-        logger.warning("dingtalk-stream not installed; DingTalk integration disabled")
-        return None
-
-    credential = dingtalk_stream.DingTalkStreamCredential(
-        settings.dingtalk_client_id, settings.dingtalk_client_secret
-    )
-    client = dingtalk_stream.DingTalkStreamClient(credential)
-    client.register_callback_handler(
-        dingtalk_stream.chatbot.ChatbotMessage.TOPIC, build_bot_handler(service)
-    )
-
-    async def _run():
-        while True:
-            try:
-                logger.info("DingTalk Stream client starting (robot=%s)", settings.dingtalk_robot_code)
-                await client.start()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("DingTalk Stream client crashed; restarting in 10s")
-                await asyncio.sleep(10)
-
-    return asyncio.create_task(_run())
+    return asyncio.create_task(_stream_loop(service))

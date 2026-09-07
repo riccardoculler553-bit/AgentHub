@@ -11,10 +11,34 @@ saved identity and reconnect automatically.
 import argparse
 import asyncio
 import json
+import logging
+import logging.handlers
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+_LOG_DIR = Path(__file__).resolve().parent / "logs"
+
+
+def _setup_logging() -> None:
+    """Execution logs (manager/executors) use module loggers; without this
+    config Python's default handler swallows everything below WARNING."""
+    _LOG_DIR.mkdir(exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(fmt)
+    logfile = logging.handlers.RotatingFileHandler(
+        _LOG_DIR / "worker.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
+    logfile.setFormatter(fmt)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(console)
+    root.addHandler(logfile)
+
+
+_setup_logging()
 
 import auth as auth_module
 import heartbeat as heartbeat_module

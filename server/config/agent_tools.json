@@ -2,9 +2,9 @@
   "tools": [
     {
       "name": "audit",
-      "label": "审单",
+      "label": "Text1",
       "command": "yingdao.audit",
-      "keywords": ["审单"],
+      "keywords": ["Text1"],
       "devices": ["办公室电脑02"]
     }
   ]

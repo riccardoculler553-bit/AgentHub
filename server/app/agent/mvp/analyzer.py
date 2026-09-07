@@ -68,7 +68,11 @@ async def analyze_with_llm(text: str, device_names: list[str]) -> ExecutionInten
                 base_url=settings.openai_api_base,
                 temperature=0,
             )
-            structured = llm.with_structured_output(ExecutionIntent)
+            # function_calling keeps args in the tool-call channel; GLM appends
+            # prose after JSON bodies which breaks strict json_schema parsing.
+            structured = llm.with_structured_output(
+                ExecutionIntent, method="function_calling"
+            )
             system = (
                 "You are the AgentHub MVP intent parser. Map the user request to "
                 "ExecutionIntent. Only these commands exist:\n"

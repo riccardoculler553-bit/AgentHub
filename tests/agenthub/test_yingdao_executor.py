@@ -70,22 +70,26 @@ def test_busy_log_mode_blocks_launch(tmp_path):
 
 def test_log_mode_idle_after_end_allows_launch(tmp_path):
     log_dir = tmp_path / "xbot-log"
-    _write_log_line(log_dir, "INFO new task started")
-    _write_log_line(log_dir, "INFO task exit code 0")  # latest marker: ended
+    now = datetime.now()
+    _write_log_line(log_dir, "INFO new task started", ts=now - timedelta(seconds=5))
+    _write_log_line(log_dir, "INFO task exit code 0", ts=now)  # latest marker: ended
     executor = _make_executor(
         tmp_path,
         check_mode="log",
-        args=["-c", "import time; time.sleep(0.2)"],
+        args=["-c", "import time; time.sleep(2)"],
         timeout=60,
     )
     result, _ = asyncio.run(_run(executor))
-    assert result["exit_code"] == 0
+    # completion comes from the log end marker, NOT process exit (the fake
+    # process is still sleeping when the marker is seen)
+    assert result["end_source"] == "log"
     assert result["launch_confirmed"] is True  # verify=0 -> skip confirmation
 
 
 def test_launch_confirmed_via_log_marker(tmp_path):
-    """verify>0: the fake robot appends a start marker to the ShadowBot log;
-    the executor must see a NEW start and proceed."""
+    """verify>0: the fake robot appends start+end markers to the ShadowBot
+    log; the executor must complete on the END marker, before the process
+    exits (launcher pattern: process outlives the task end marker)."""
     log_dir = tmp_path / "xbot-log"
     old = datetime.now() - timedelta(minutes=5)
     _write_log_line(log_dir, "INFO new task started", ts=old)
@@ -97,7 +101,10 @@ def test_launch_confirmed_via_log_marker(tmp_path):
         f"time.sleep(0.3)\n"
         "stamp = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:23]\n"
         f"open(r'{log_path}', 'a', encoding='utf-8').write(stamp + ' INFO new task started\\n')\n"
-        "time.sleep(0.2)\n"
+        "time.sleep(2)\n"
+        "stamp2 = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:23]\n"
+        f"open(r'{log_path}', 'a', encoding='utf-8').write(stamp2 + ' INFO task exit\\n')\n"
+        "time.sleep(1)\n"  # process outlives the end marker on purpose
     )
     executor = _make_executor(
         tmp_path,
@@ -107,8 +114,39 @@ def test_launch_confirmed_via_log_marker(tmp_path):
         timeout=60,
     )
     result, _ = asyncio.run(_run(executor))
-    assert result["exit_code"] == 0
+    assert result["end_source"] == "log"
     assert result["launch_confirmed"] is True
+    assert result["duration"] < 4  # completed on the marker (~2.3s), not process exit
+
+
+def test_launcher_exit_without_end_marker_times_out(tmp_path):
+    """ShadowBot.exe exits immediately (launcher pattern) but the log never
+    shows an end marker -> the task must NOT be reported complete; it times
+    out instead."""
+    log_dir = tmp_path / "xbot-log"
+    old = datetime.now() - timedelta(minutes=5)
+    _write_log_line(log_dir, "INFO new task started", ts=old)
+    _write_log_line(log_dir, "INFO task exit", ts=old)
+    log_path = busy_check.today_log_path(str(log_dir))
+
+    script = (
+        "import time\n"
+        "time.sleep(0.3)\n"
+        "stamp = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:23]\n"
+        f"open(r'{log_path}', 'a', encoding='utf-8').write(stamp + ' INFO new task started\\n')\n"
+        # no end marker: engine keeps "running" while the launcher exits
+    )
+    executor = _make_executor(
+        tmp_path,
+        check_mode="log",
+        launch_verify_seconds=5,
+        args=["-c", script],
+        timeout=2,
+    )
+    with pytest.raises(ExecutionError) as excinfo:
+        asyncio.run(_run(executor))
+    assert excinfo.value.code == "EXECUTOR_TIMEOUT"
+    _wait_no_alive_processes()
 
 
 def test_launch_unconfirmed_fails_after_retries(tmp_path):

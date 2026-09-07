@@ -236,7 +236,15 @@ function fmtTime(iso) {
   if (s < 86400) return Math.floor(s / 3600) + "h ago";
   return Math.floor(s / 86400) + "d ago";
 }
-function fmtAbs(iso) { return iso ? iso.replace("T", " ").slice(0, 19) : "-"; }
+function fmtAbs(iso) {
+  if (!iso) return "-";
+  /* server stores naive UTC; render in the viewer's local timezone */
+  const d = new Date(iso + "Z");
+  if (isNaN(d.getTime())) return iso.replace("T", " ").slice(0, 19);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+         `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 function badge(status) { return `<span class="badge b-${esc(status)}">${esc(status)}</span>`; }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));

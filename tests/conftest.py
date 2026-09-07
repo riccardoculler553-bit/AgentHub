@@ -4,6 +4,7 @@ DATABASE_URL is forced to a file-based SQLite BEFORE app modules are imported,
 so config picks it up at import time.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -33,9 +34,49 @@ import app.core.config as _config  # noqa: E402
 # .env may define AGENTHUB_ADMIN_TOKEN; tests exercise the open mode
 # (empty token disables admin auth by contract).
 _config.settings.admin_token = ""
+# .env may now configure a real LLM key (e.g. Zhipu GLM): load_dotenv refills
+# os.environ after our pop above, so force-disable LLM on the settings object
+# itself - tests must be deterministic and offline (rules fallback only).
+_config.settings.openai_api_key = None
+
+# Tests own their tool table: server/config/agent_tools.json is user-editable
+# at runtime (label/keywords/devices), so tests must not depend on it.
+_TEST_TOOLS = Path(tempfile.mkdtemp(prefix="agenthub-tools-")) / "agent_tools.json"
+_TEST_TOOLS.write_text(
+    json.dumps(
+        {
+            "tools": [
+                {
+                    "name": "audit",
+                    "label": "审单",
+                    "command": "yingdao.audit",
+                    "keywords": ["审单"],
+                    "devices": ["办公室电脑02", "仓库电脑01", "测试机A"],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    ),
+    encoding="utf-8",
+)
+TEST_TOOLS_CONFIG = str(_TEST_TOOLS)
+_config.settings.agent_tools_config = TEST_TOOLS_CONFIG
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+
+from app.agent.mvp.tools import tool_registry as _tool_registry  # noqa: E402
+
+_tool_registry.reload()
+
+
+@pytest.fixture(autouse=True)
+def _restore_tool_registry():
+    """Tests may repoint agent_tools_config (mvp routing fixtures); restore
+    the conftest-owned table and reload afterwards."""
+    yield
+    _config.settings.agent_tools_config = TEST_TOOLS_CONFIG
+    _tool_registry.reload()
 
 from app.db.database import Base, engine  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402

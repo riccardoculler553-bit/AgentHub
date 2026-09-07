@@ -231,6 +231,20 @@ def build_busy_checker(check_mode: str, log_dir: str, process_names, exe_name: s
     return lambda: is_task_running(log_dir)
 
 
+def task_end_seen(log_dir: str, started_after) -> bool:
+    """True when the log shows a task END that happened after `started_after`
+    (the start timestamp of OUR run). This is the reliable completion signal:
+    ShadowBot.exe may exit immediately as a launcher or stay open after the
+    task - only the log's end marker proves the robot actually finished."""
+    tail = read_log_tail(log_dir)
+    if tail is None:
+        return False
+    last_start, last_end, _, last_end_time = scan_markers(tail)
+    if last_end <= last_start or last_end_time is None:
+        return False
+    return started_after is None or last_end_time > started_after
+
+
 # ------------------------------------------------------------- success box
 
 
