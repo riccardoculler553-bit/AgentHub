@@ -1,0 +1,86 @@
+"""AgentHub Task persistent models: tasks / task_steps / task_attempts / task_events.
+
+Task = full business lifecycle (NOT a message). One task may span several steps,
+each step may have several attempts (retries). task_events keeps the whole
+lifecycle for dashboard timeline / audit / agent state recovery.
+"""
+
+from datetime import datetime
+
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.database import Base
+from app.db.models import BigIntPK, utcnow
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(64), unique=True)
+    name: Mapped[str] = mapped_column(String(200), default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="admin")
+    target_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    # PENDING/DISPATCHING/SENT/ACCEPTED/RUNNING/SUCCESS/FAILED/TIMEOUT/CANCELLED
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    timeout_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class TaskStep(Base):
+    __tablename__ = "task_steps"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    step_id: Mapped[str] = mapped_column(String(64), unique=True)
+    task_id: Mapped[str] = mapped_column(String(64), ForeignKey("tasks.task_id"), index=True)
+    order_no: Mapped[int] = mapped_column(Integer, default=1)
+    # device_id is inherited from the task in V1.0; nullable column reserved
+    # for future cross-device workflows.
+    device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    command: Mapped[str] = mapped_column(String(128))
+    params: Mapped[dict] = mapped_column(JSON, default=dict)
+    # PENDING/RUNNING/SUCCESS/FAILED/TIMEOUT/CANCELLED
+    status: Mapped[str] = mapped_column(String(32), default="PENDING")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class TaskAttempt(Base):
+    __tablename__ = "task_attempts"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    attempt_id: Mapped[str] = mapped_column(String(64), unique=True)
+    task_id: Mapped[str] = mapped_column(String(64), ForeignKey("tasks.task_id"), index=True)
+    step_id: Mapped[str] = mapped_column(String(64), ForeignKey("task_steps.step_id"), index=True)
+    device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    attempt_no: Mapped[int] = mapped_column(Integer, default=1)
+    # DISPATCHING/SENT/ACCEPTED/RUNNING/SUCCESS/FAILED/TIMEOUT/CANCELLED
+    status: Mapped[str] = mapped_column(String(32), default="DISPATCHING")
+    dispatch_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class TaskEvent(Base):
+    __tablename__ = "task_events"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(64), index=True)
+    step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempt_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # task.created/dispatching/sent/accepted/running/progress/success/failed/
+    # cancelled/timeout/retry_requested
+    event_type: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

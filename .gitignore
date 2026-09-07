@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+.env
+client_data/
+*.log
+*.db
+*.sqlite3
+.debug/
+.trae/
+client.zip
+.pt*.txt

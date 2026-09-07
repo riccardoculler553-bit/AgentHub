@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentHub Dashboard</title>
+<style>
+  :root {
+    --green:#22c55e; --red:#ef4444; --amber:#f59e0b; --blue:#3b82f6; --gray:#9ca3af;
+    --bg:#0f172a; --card:#1e293b; --card2:#16213a; --line:#273449; --text:#e2e8f0; --muted:#94a3b8;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--text); padding:24px; }
+  h1 { font-size:22px; margin-bottom:2px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:14px; }
+  .admin { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); margin-bottom:14px; }
+  .admin .ok { color:var(--green); }
+  .admin .off { color:var(--red); }
+  nav { display:flex; gap:6px; margin-bottom:18px; flex-wrap:wrap; }
+  nav button { background:var(--card); color:var(--muted); border:1px solid var(--line); padding:8px 18px; border-radius:8px 8px 0 0; font-size:13px; }
+  nav button.active { background:#2563eb; color:#fff; border-color:#2563eb; }
+  .toolbar { display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap; align-items:center; }
+  input[type=text], select, textarea {
+    background:#0b1220; border:1px solid #334155; color:var(--text);
+    padding:8px 12px; border-radius:6px; font-size:13px; min-width:160px;
+  }
+  textarea { width:100%; min-height:90px; resize:vertical; font-family:inherit; }
+  button { background:#2563eb; border:none; color:#fff; padding:8px 14px; border-radius:6px; font-size:13px; cursor:pointer; }
+  button:hover { filter:brightness(1.15); }
+  button.danger { background:var(--red); }
+  button.ghost { background:#334155; }
+  button.warn { background:var(--amber); color:#1f2937; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .code-box { display:none; background:var(--card); border:1px solid #334155; border-radius:8px; padding:14px 18px; margin-bottom:16px; font-size:14px; }
+  .code-box b { color:var(--green); font-size:18px; letter-spacing:2px; font-family:monospace; }
+  .code-box .exp { color:var(--muted); font-size:12px; margin-left:12px; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border-radius:8px; overflow:hidden; font-size:13px; }
+  th,td { padding:10px 14px; text-align:left; border-bottom:1px solid var(--line); }
+  th { background:var(--card2); color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
+  tr:last-child td { border-bottom:none; }
+  tr.clickable { cursor:pointer; }
+  tr.clickable:hover td { background:#24304d; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .online .dot { background:var(--green); box-shadow:0 0 6px var(--green); }
+  .offline .dot { background:var(--gray); }
+  .revoked .dot { background:var(--red); }
+  .muted { color:var(--muted); }
+  .mono { font-family:monospace; font-size:12px; }
+  .actions button { padding:4px 10px; font-size:12px; margin-right:6px; }
+  .empty { text-align:center; color:var(--muted); padding:32px !important; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:10px; font-size:11px; font-weight:600; letter-spacing:.5px; }
+  .b-PENDING   { background:#374151; color:#e5e7eb; }
+  .b-DISPATCHING, .b-SENT, .b-ACCEPTED { background:#1d4ed8; color:#eff6ff; }
+  .b-RUNNING   { background:#b45309; color:#fffbeb; }
+  .b-SUCCESS   { background:#15803d; color:#f0fdf4; }
+  .b-FAILED, .b-TIMEOUT { background:#b91c1c; color:#fef2f2; }
+  .b-CANCELLED { background:#4b5563; color:#f3f4f6; }
+  .chip { display:inline-block; background:#0b1220; border:1px solid #334155; color:var(--text);
+          padding:2px 10px; border-radius:10px; font-size:12px; margin:2px 4px 2px 0; font-family:monospace; }
+  .modal-mask { display:none; position:fixed; inset:0; background:rgba(2,6,23,.72); z-index:50; padding:40px 16px; overflow:auto; }
+  .modal { background:var(--card); border:1px solid #334155; border-radius:12px; max-width:960px; margin:0 auto; padding:20px 24px; }
+  .modal h2 { font-size:17px; margin-bottom:4px; }
+  .modal .close { float:right; background:#334155; padding:4px 12px; }
+  .kv { display:grid; grid-template-columns:140px 1fr; gap:4px 12px; font-size:13px; margin:12px 0; }
+  .kv .k { color:var(--muted); }
+  .section-title { font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin:18px 0 8px; }
+  .timeline { list-style:none; border-left:2px solid #334155; margin-left:8px; }
+  .timeline li { position:relative; padding:6px 0 6px 18px; font-size:13px; }
+  .timeline li::before { content:""; position:absolute; left:-6px; top:12px; width:10px; height:10px;
+                         border-radius:50%; background:#2563eb; box-shadow:0 0 0 3px #0f172a; }
+  .timeline .t { color:var(--muted); font-size:11px; margin-right:8px; font-family:monospace; }
+  .timeline code { background:#0b1220; padding:1px 6px; border-radius:4px; font-size:12px; }
+  pre { background:#0b1220; border:1px solid #334155; border-radius:8px; padding:12px; font-size:12px;
+        overflow:auto; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; }
+  .agent-out .ok { color:var(--green); }
+  .agent-out .bad { color:var(--red); }
+</style>
+</head>
+<body>
+<h1>AgentHub</h1>
+<div class="sub">DeviceLink 中台 · 任务控制与智能编排 · V1.0</div>
+<div class="admin" id="adminBar">
+  <span id="adminState" class="off">Admin Token 未设置</span>
+  <input type="text" id="adminToken" placeholder="AGENTHUB_ADMIN_TOKEN（X-Admin-Token）" style="min-width:280px">
+  <button class="ghost" onclick="saveToken()">保存</button>
+  <button class="ghost" onclick="clearToken()">清除</button>
+</div>
+
+<nav>
+  <button data-tab="devices" class="active" onclick="showTab('devices')">设备</button>
+  <button data-tab="tasks" onclick="showTab('tasks')">任务</button>
+  <button data-tab="commands" onclick="showTab('commands')">命令</button>
+  <button data-tab="capabilities" onclick="showTab('capabilities')">能力</button>
+  <button data-tab="agent" onclick="showTab('agent')">Agent</button>
+</nav>
+
+<!-- ============================== 设备 ============================== -->
+<section id="tab-devices">
+  <div class="toolbar">
+    <input type="text" id="deviceName" placeholder="设备名称，如：办公室电脑01">
+    <button onclick="createCode()">创建注册码</button>
+    <button class="ghost" onclick="refreshDevices()">立即刷新</button>
+  </div>
+  <div class="code-box" id="codeBox">
+    新注册码：<b id="codeText"></b><span class="exp" id="codeExp"></span>
+    <span class="muted">（一次性，5 分钟内有效，仅显示一次）</span>
+  </div>
+  <table>
+    <thead>
+      <tr><th>设备</th><th>Device ID</th><th>平台</th><th>主机名</th>
+          <th>状态</th><th>连接数</th><th>最后心跳</th><th>版本</th><th>操作</th></tr>
+    </thead>
+    <tbody id="deviceRows"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+  </table>
+</section>
+
+<!-- ============================== 任务 ============================== -->
+<section id="tab-tasks" style="display:none">
+  <div class="toolbar">
+    <select id="taskStatus" onchange="refreshTasks()">
+      <option value="">全部状态</option>
+      <option>PENDING</option><option>DISPATCHING</option><option>SENT</option>
+      <option>ACCEPTED</option><option>RUNNING</option><option>SUCCESS</option>
+      <option>FAILED</option><option>TIMEOUT</option><option>CANCELLED</option>
+    </select>
+    <button class="ghost" onclick="refreshTasks()">刷新</button>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Task ID</th><th>名称</th><th>目标设备</th><th>状态</th>
+          <th>创建</th><th>结束</th><th>操作</th></tr>
+    </thead>
+    <tbody id="taskRows"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+  </table>
+</section>
+
+<!-- ============================== 命令 ============================== -->
+<section id="tab-commands" style="display:none">
+  <div class="toolbar"><button class="ghost" onclick="refreshCommands()">刷新</button></div>
+  <table>
+    <thead><tr><th>命令</th><th>版本</th><th>执行器</th><th>参数 Schema</th><th>超时</th><th>启用</th><th>描述</th></tr></thead>
+    <tbody id="commandRows"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+  </table>
+</section>
+
+<!-- ============================== 能力 ============================== -->
+<section id="tab-capabilities" style="display:none">
+  <div class="toolbar"><button class="ghost" onclick="refreshCapabilities()">刷新</button></div>
+  <table>
+    <thead><tr><th>设备</th><th>上报能力</th></tr></thead>
+    <tbody id="capRows"><tr><td colspan="2" class="empty">加载中…</td></tr></tbody>
+  </table>
+</section>
+
+<!-- ============================== Agent ============================== -->
+<section id="tab-agent" style="display:none">
+  <div class="toolbar"><span class="muted">自然语言 → 规划 → 派发 → 等待 → 评估（自动重试 / 重规划）</span></div>
+  <textarea id="agentRequest" placeholder="例如：在 办公室电脑01 上 echo '部署完成'">在 测试设备A 上 echo 'hello agent'</textarea>
+  <div class="toolbar"><button onclick="runAgent()">运行</button><span id="agentSpin" class="muted" style="display:none">运行中，可能需要数十秒…</span></div>
+  <div id="agentOut" class="agent-out"></div>
+</section>
+
+<!-- ============================== 任务详情弹窗 ============================== -->
+<div class="modal-mask" id="taskModal">
+  <div class="modal">
+    <button class="close" onclick="closeModal()">关闭</button>
+    <h2 id="tmTitle">Task</h2>
+    <div id="tmBody"></div>
+  </div>
+</div>
+
+<script>
+const API = "";
+const TOKEN_KEY = "ah_admin_token";
+let adminToken = localStorage.getItem(TOKEN_KEY) || "";
+
+function authHeaders(extra = {}) {
+  return adminToken ? { "X-Admin-Token": adminToken, ...extra } : extra;
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(API + path, {
+    ...options,
+    headers: authHeaders({ "Content-Type": "application/json", ...(options.headers || {}) }),
+  });
+  if (res.status === 401) {
+    setAdminState(false);
+    throw new Error("需要有效的 Admin Token（右上角设置后重试）");
+  }
+  return res;
+}
+
+function setAdminState(ok) {
+  const el = document.getElementById("adminState");
+  el.textContent = ok ? "Admin Token 已设置" : (adminToken ? "Admin Token 无效" : "Admin Token 未设置");
+  el.className = ok ? "ok" : "off";
+}
+function saveToken() {
+  adminToken = document.getElementById("adminToken").value.trim();
+  localStorage.setItem(TOKEN_KEY, adminToken);
+  setAdminState(true);
+  refreshAll();
+}
+function clearToken() {
+  adminToken = ""; localStorage.removeItem(TOKEN_KEY);
+  document.getElementById("adminToken").value = "";
+  setAdminState(false);
+  refreshAll();
+}
+
+function showTab(name) {
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll("section[id^=tab-]").forEach(s => s.style.display = s.id === "tab-" + name ? "" : "none");
+  if (name === "devices") refreshDevices();
+  if (name === "tasks") refreshTasks();
+  if (name === "commands") refreshCommands();
+  if (name === "capabilities") refreshCapabilities();
+}
+function refreshAll() {
+  refreshDevices();
+  if (visible("tasks")) refreshTasks();
+  if (visible("commands")) refreshCommands();
+  if (visible("capabilities")) refreshCapabilities();
+}
+function visible(name) {
+  return document.getElementById("tab-" + name).style.display !== "none";
+}
+
+function fmtTime(iso) {
+  if (!iso) return "-";
+  const ms = Date.now() - new Date(iso + "Z").getTime();
+  if (ms < 0) return "now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+function fmtAbs(iso) { return iso ? iso.replace("T", " ").slice(0, 19) : "-"; }
+function badge(status) { return `<span class="badge b-${esc(status)}">${esc(status)}</span>`; }
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+/* ============================== 设备 ============================== */
+async function refreshDevices() {
+  try {
+    const devices = await api("/api/devices").then(r => r.json());
+    const tbody = document.getElementById("deviceRows");
+    if (!devices.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">还没有设备，先创建注册码吧</td></tr>';
+      return;
+    }
+    tbody.innerHTML = devices.map(d => {
+      const cls = d.status === "online" ? "online" : (d.status === "revoked" ? "revoked" : "offline");
+      return `<tr class="${cls}">
+        <td><span class="dot"></span><b>${esc(d.name)}</b></td>
+        <td class="mono muted">${esc(d.device_id.slice(0,8))}…</td>
+        <td>${esc(d.platform || "-")}</td>
+        <td>${esc(d.hostname || "-")}</td>
+        <td>${esc(d.status.toUpperCase())}</td>
+        <td>${d.connection_count}</td>
+        <td>${fmtTime(d.last_seen_at)}</td>
+        <td class="mono">${esc(d.client_version || "-")}</td>
+        <td class="actions">
+          ${d.status === "online" ? `<button onclick="sendMessage('${d.device_id}','${esc(d.name)}')">发消息</button>` : ""}
+          ${d.status !== "revoked" ? `<button class="danger" onclick="revoke('${d.device_id}','${esc(d.name)}')">撤销</button>` : ""}
+        </td>
+      </tr>`;
+    }).join("");
+  } catch (e) {
+    document.getElementById("deviceRows").innerHTML =
+      `<tr><td colspan="9" class="empty">${esc(e.message || "无法连接服务器")}</td></tr>`;
+  }
+}
+
+async function createCode() {
+  const name = document.getElementById("deviceName").value.trim();
+  try {
+    const res = await api("/api/device-registration", { method: "POST", body: JSON.stringify({ device_name: name }) });
+    const data = await res.json();
+    if (!res.ok) { alert("创建失败: " + JSON.stringify(data)); return; }
+    document.getElementById("codeBox").style.display = "block";
+    document.getElementById("codeText").textContent = data.code;
+    document.getElementById("codeExp").textContent = "过期时间: " + data.expires_at;
+  } catch (e) { alert(e.message); }
+}
+
+async function sendMessage(deviceId, name) {
+  const content = prompt(`发送消息到 ${name}:`, "hello device");
+  if (content === null) return;
+  try {
+    const res = await api(`/api/devices/${deviceId}/messages`, { method: "POST", body: JSON.stringify({ type: "message", data: { content } }) });
+    if (!res.ok) { alert("发送失败: " + (await res.text())); return; }
+    const data = await res.json();
+    alert(`已投递到 ${data.sent} 个连接\nmessage_id: ${data.message_id}`);
+  } catch (e) { alert(e.message); }
+}
+
+async function revoke(deviceId, name) {
+  if (!confirm(`确定撤销设备 ${name}？撤销后 Token 立即失效。`)) return;
+  try { await api(`/api/devices/${deviceId}/revoke`, { method: "POST" }); } catch (e) { alert(e.message); }
+  refreshDevices();
+}
+
+/* ============================== 任务 ============================== */
+async function refreshTasks() {
+  const status = document.getElementById("taskStatus").value;
+  const qs = status ? `?status=${encodeURIComponent(status)}&limit=100` : "?limit=100";
+  const tbody = document.getElementById("taskRows");
+  try {
+    const tasks = await api("/api/tasks" + qs).then(r => r.json());
+    if (!tasks.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无任务，可在 Agent 页用自然语言下发</td></tr>';
+      return;
+    }
+    tbody.innerHTML = tasks.map(t => `
+      <tr class="clickable" onclick="openTask('${t.task_id}')">
+        <td class="mono">${esc(t.task_id.slice(0, 14))}…</td>
+        <td>${esc(t.name)}</td>
+        <td class="mono muted">${esc((t.target_device_id || "-").slice(0, 8))}${t.target_device_id ? "…" : ""}</td>
+        <td>${badge(t.status)}</td>
+        <td>${fmtTime(t.created_at)}</td>
+        <td>${t.finished_at ? fmtTime(t.finished_at) : "-"}</td>
+        <td class="actions" onclick="event.stopPropagation()">
+          ${!["SUCCESS","FAILED","TIMEOUT","CANCELLED"].includes(t.status)
+            ? `<button class="warn" onclick="cancelTask('${t.task_id}')">取消</button>` : ""}
+          ${["FAILED","TIMEOUT"].includes(t.status)
+            ? `<button onclick="retryTask('${t.task_id}')">重试</button>` : ""}
+          <button class="ghost" onclick="openTask('${t.task_id}')">详情</button>
+        </td>
+      </tr>`).join("");
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty">${esc(e.message)}</td></tr>`;
+  }
+}
+async function cancelTask(id) {
+  if (!confirm(`取消任务 ${id.slice(0,14)}…？`)) return;
+  try { await api(`/api/tasks/${id}/cancel`, { method: "POST" }); } catch (e) { alert(e.message); }
+  refreshTasks();
+}
+async function retryTask(id) {
+  try { await api(`/api/tasks/${id}/retry`, { method: "POST" }); } catch (e) { alert(e.message); }
+  refreshTasks();
+}
+
+async function openTask(id) {
+  let t;
+  try { t = await api(`/api/tasks/${id}`).then(r => r.json()); }
+  catch (e) { alert(e.message); return; }
+  document.getElementById("tmTitle").innerHTML = `Task ${esc(t.task_id)} ${badge(t.status)}`;
+  document.getElementById("tmBody").innerHTML = `
+    <div class="kv">
+      <div class="k">名称</div><div>${esc(t.name)}</div>
+      <div class="k">目标设备</div><div class="mono">${esc(t.target_device_id || "-")}</div>
+      <div class="k">优先级 / 最大尝试</div><div>${t.priority} / ${t.max_attempts}</div>
+      <div class="k">创建</div><div>${fmtAbs(t.created_at)}</div>
+      <div class="k">开始</div><div>${fmtAbs(t.started_at)}</div>
+      <div class="k">结束</div><div>${fmtAbs(t.finished_at)}</div>
+      <div class="k">超时点</div><div>${fmtAbs(t.timeout_at)}</div>
+    </div>
+    <div class="section-title">步骤</div>
+    <table><thead><tr><th>#</th><th>Step</th><th>命令</th><th>参数</th><th>状态</th><th>开始</th><th>结束</th></tr></thead>
+    <tbody>${t.steps.map(s => `<tr>
+        <td>${s.order_no}</td><td class="mono">${esc(s.step_id.slice(0,12))}…</td>
+        <td><code class="mono">${esc(s.command)}</code></td>
+        <td class="mono">${esc(JSON.stringify(s.params))}</td>
+        <td>${badge(s.status)}</td><td>${fmtAbs(s.started_at)}</td><td>${fmtAbs(s.finished_at)}</td>
+      </tr>`).join("") || '<tr><td colspan="7" class="empty">无</td></tr>'}</tbody></table>
+    <div class="section-title">尝试（Attempts）</div>
+    <table><thead><tr><th>#</th><th>Step</th><th>设备</th><th>状态</th><th>错误码</th><th>错误信息</th></tr></thead>
+    <tbody>${t.attempts.map(a => `<tr>
+        <td>${a.attempt_no}</td><td class="mono">${esc((a.step_id||"").slice(0,12))}…</td>
+        <td class="mono">${esc((a.device_id||"-").slice(0,8))}</td>
+        <td>${badge(a.status)}</td>
+        <td class="mono">${esc(a.error_code || "-")}</td>
+        <td>${esc(a.error_message || "-")}</td>
+      </tr>`).join("") || '<tr><td colspan="6" class="empty">无</td></tr>'}</tbody></table>
+    <div class="section-title">事件时间线</div>
+    <ul class="timeline">
+      ${t.events.slice().reverse().map(e => `<li>
+        <span class="t">${fmtAbs(e.created_at)}</span>
+        <code>${esc(e.event_type)}</code>
+        ${e.step_id ? `<span class="muted mono">step ${esc(e.step_id.slice(0,10))}…</span>` : ""}
+        ${Object.keys(e.payload || {}).length ? `<pre>${esc(JSON.stringify(e.payload, null, 2))}</pre>` : ""}
+      </li>`).join("") || '<li class="muted">无事件</li>'}
+    </ul>`;
+  document.getElementById("taskModal").style.display = "block";
+}
+function closeModal() { document.getElementById("taskModal").style.display = "none"; }
+
+/* ============================== 命令 ============================== */
+async function refreshCommands() {
+  const tbody = document.getElementById("commandRows");
+  try {
+    const cmds = await api("/api/commands").then(r => r.json());
+    if (!cmds.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">无注册命令</td></tr>';
+      return;
+    }
+    tbody.innerHTML = cmds.map(c => `<tr>
+      <td><code class="mono">${esc(c.command_name)}</code></td>
+      <td class="mono">${esc(c.version)}</td>
+      <td>${esc(c.executor_type)}</td>
+      <td class="mono">${esc(JSON.stringify(c.params_schema))}</td>
+      <td>${c.timeout}s</td>
+      <td>${c.enabled ? "✔" : "✘"}</td>
+      <td class="muted">${esc(c.description)}</td>
+    </tr>`).join("");
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty">${esc(e.message)}</td></tr>`;
+  }
+}
+
+/* ============================== 能力 ============================== */
+async function refreshCapabilities() {
+  const tbody = document.getElementById("capRows");
+  try {
+    const groups = await api("/api/capabilities").then(r => r.json());
+    if (!groups.length) {
+      tbody.innerHTML = '<tr><td colspan="2" class="empty">设备尚未上报能力（Worker 连接后自动上报）</td></tr>';
+      return;
+    }
+    tbody.innerHTML = groups.map(g => `<tr>
+      <td class="mono">${esc(g.device_id)}</td>
+      <td>${g.capabilities.map(c => `<span class="chip">${esc(c.name)} v${esc(c.version)}</span>`).join("")}</td>
+    </tr>`).join("");
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="2" class="empty">${esc(e.message)}</td></tr>`;
+  }
+}
+
+/* ============================== Agent ============================== */
+async function runAgent() {
+  const btn = event ? event.target : null;
+  const request = document.getElementById("agentRequest").value.trim();
+  if (!request) return;
+  const out = document.getElementById("agentOut");
+  const spin = document.getElementById("agentSpin");
+  if (btn) btn.disabled = true;
+  spin.style.display = "";
+  out.innerHTML = "";
+  const started = Date.now();
+  try {
+    const res = await api("/api/agent/run", { method: "POST", body: JSON.stringify({ request }) });
+    const body = await res.json();
+    if (!res.ok) { out.innerHTML = `<pre class="bad">${esc(JSON.stringify(body, null, 2))}</pre>`; return; }
+    const secs = ((Date.now() - started) / 1000).toFixed(1);
+    const plan = body.execution_plan;
+    const result = body.task_result && body.task_result.payload;
+    out.innerHTML = `
+      <div class="kv">
+        <div class="k">耗时</div><div>${secs}s</div>
+        <div class="k">决策</div><div class="${body.decision === "finish" ? "ok" : "bad"}">${esc(body.decision)}</div>
+        <div class="k">任务</div><div>${body.task_id
+          ? `<span class="mono">${esc(body.task_id)}</span> ${badge(body.task_status || "")}
+             <button class="ghost" onclick="openTask('${body.task_id}')">查看详情</button>` : "-"}</div>
+        <div class="k">重试 / 重规划</div><div>${body.retry_count} / ${body.replan_count}</div>
+        ${plan ? `<div class="k">规划依据</div><div>${esc(plan.rationale)}</div>` : ""}
+      </div>
+      ${plan ? `<div class="section-title">Execution Plan</div>
+        <pre>${esc(JSON.stringify(plan, null, 2))}</pre>` : ""}
+      ${result ? `<div class="section-title">任务结果</div><pre>${esc(JSON.stringify(result, null, 2))}</pre>` : ""}
+      ${body.error ? `<div class="section-title">错误</div><pre class="bad">${esc(JSON.stringify(body.error, null, 2))}</pre>` : ""}`;
+  } catch (e) {
+    out.innerHTML = `<pre class="bad">${esc(e.message)}</pre>`;
+  } finally {
+    if (btn) btn.disabled = false;
+    spin.style.display = "none";
+  }
+}
+
+document.getElementById("adminToken").value = adminToken;
+setAdminState(!!adminToken);
+refreshDevices();
+setInterval(refreshDevices, 3000);
+setInterval(() => { if (visible("tasks")) refreshTasks(); }, 5000);
+</script>
+</body>
+</html>

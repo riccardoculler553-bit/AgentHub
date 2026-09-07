@@ -1,0 +1,6 @@
+{
+  "capabilities": [
+    { "name": "echo", "version": "1.0", "executor_type": "echo" },
+    { "name": "python.demo", "version": "1.0", "executor_type": "python" }
+  ]
+}
