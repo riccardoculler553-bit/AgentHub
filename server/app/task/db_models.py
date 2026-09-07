@@ -47,6 +47,9 @@ class TaskStep(Base):
     params: Mapped[dict] = mapped_column(JSON, default=dict)
     # PENDING/RUNNING/SUCCESS/FAILED/TIMEOUT/CANCELLED
     status: Mapped[str] = mapped_column(String(32), default="PENDING")
+    # V1.1: the attempt that currently owns this step. Device events whose
+    # attempt_id differs are recorded as stale but never mutate state.
+    current_attempt_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -66,6 +69,9 @@ class TaskAttempt(Base):
     dispatch_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # V1.1: per-attempt deadline (task.timeout_at is refreshed per dispatch;
+    # attempt.timeout_at makes the timeout bound to THIS attempt only).
+    timeout_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

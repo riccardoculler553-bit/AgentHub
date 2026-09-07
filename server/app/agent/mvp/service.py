@@ -10,10 +10,21 @@ import asyncio
 import logging
 from typing import Protocol
 
+from sqlalchemy.exc import IntegrityError
+
 from app.agent.mvp.graph import build_mvp_graph
 from app.agent.runs import AgentRunService
 
 logger = logging.getLogger(__name__)
+
+# V1.1 §20: AgentRun keeps the task's real terminal status (no more squashing
+# TIMEOUT/CANCELLED into FAILED) so dashboards and audits see the truth.
+TASK_STATUS_TO_RUN = {
+    "SUCCESS": "SUCCESS",
+    "FAILED": "FAILED",
+    "TIMEOUT": "TIMEOUT",
+    "CANCELLED": "CANCELLED",
+}
 
 
 class ReplySender(Protocol):
@@ -84,7 +95,7 @@ class MvpAgentService:
                     if node_name == "build_reply":
                         reply = state.get("reply", "")
                         await self._send(run_id, reply, kind="final")
-                        status = "SUCCESS" if state.get("task_status") == "SUCCESS" else "FAILED"
+                        status = TASK_STATUS_TO_RUN.get(state.get("task_status"), "FAILED")
                         self._finish(run_id, status=status, final_reply=reply, state=state)
                         return
             # Graph ended without build_reply (defensive): close the run out.

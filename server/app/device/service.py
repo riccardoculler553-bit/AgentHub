@@ -51,5 +51,8 @@ class DeviceService:
             created_at=device.created_at,
             revoked_at=device.revoked_at,
             connection_count=connection_count,
-            online=device.status == "online",
+            # Hub truth (V1.1 §38): a device is online iff it holds >=1 live
+            # connection. DB status is the grace-period view kept by the
+            # HeartbeatMonitor and deliberately lags behind socket loss.
+            online=connection_count > 0,
         )

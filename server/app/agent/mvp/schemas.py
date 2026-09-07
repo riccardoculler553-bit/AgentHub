@@ -44,7 +44,8 @@ class AgentRunRecordOut(BaseModel):
     conversation_id: str
     sender_id: str
     sender_name: str | None = None
-    message_id: str
+    # NULL when absent (API channel) - exempt from the idempotency unique key
+    message_id: str | None = None
     input_text: str
     status: str
     task_id: str | None = None

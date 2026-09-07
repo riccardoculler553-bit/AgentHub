@@ -28,22 +28,55 @@ class TaskDispatcher:
 
     async def dispatch_task(self, task_id: str) -> bool:
         """Dispatch the next pending step of a PENDING task. Returns True when
-        the task envelope hit at least one live connection."""
+        the task envelope hit at least one live connection.
+
+        V1.1 §10: the PENDING -> DISPATCHING claim is a single conditional
+        UPDATE. When several dispatchers race (Monitor / MVP agent / API),
+        exactly one wins the CAS and creates the attempt; the losers see 0
+        affected rows and return False - duplicate attempts are impossible."""
         with SessionLocal() as db:
             service = TaskService(db)
             try:
-                task = service.get(task_id)
+                service.get(task_id)  # 404 fast-path
             except Exception:
                 return False
-            if task.status != "PENDING" or task.target_device_id is None:
+
+            # ---- CAS claim (atomic): 1 row = this dispatcher owns the task
+            claimed = (
+                db.query(Task)
+                .filter(Task.task_id == task_id, Task.status == "PENDING")
+                .update({"status": "DISPATCHING"}, synchronize_session=False)
+            )
+            db.commit()
+            if claimed != 1:
+                return False
+            db.expire_all()  # re-read the freshly claimed task
+            task = service.get(task_id)
+
+            if task.target_device_id is None:
+                # Defensive: create() enforces a target device in V1.0.
+                task.status = "FAILED"
+                task.finished_at = utcnow()
+                service._record(task_id, "task.failed", payload={"error_code": "TASK_VALIDATION", "error_message": "target_device_id is required"})
+                db.commit()
                 return False
             step = service.next_pending_step(task_id)
             if step is None:
+                # Every step already terminal (raced a final result while we
+                # held the claim): close the task instead of leaving it stuck.
+                task.status = "FAILED"
+                task.finished_at = utcnow()
+                service._record(task_id, "task.failed", payload={"error_code": "NO_PENDING_STEP", "error_message": "no PENDING step to dispatch"})
+                db.commit()
                 return False
             device_id = task.target_device_id
 
             if not self.device_link.is_online(device_id):
-                return False  # stay PENDING; the monitor retries while within max wait
+                # Stay dispatchable: revert to PENDING, the monitor retries
+                # while the task is within its offline max wait.
+                task.status = "PENDING"
+                db.commit()
+                return False
 
             # Device lock (PDF §81): only one live task per device. The MVP
             # agent checks this before creating the task; this is the race
@@ -86,7 +119,9 @@ class TaskDispatcher:
                 status="DISPATCHING",
             )
             db.add(attempt)
-            task.status = "DISPATCHING"
+            # V1.1 §7: this attempt becomes the step's current context; events
+            # naming any other attempt are recorded as stale but never applied.
+            step.current_attempt_id = attempt.attempt_id
             service._record(task_id, "task.dispatching", step_id=step.step_id, attempt_id=attempt.attempt_id)
             db.commit()
 
@@ -107,6 +142,7 @@ class TaskDispatcher:
                 # Race with disconnect: roll back to PENDING, monitor retries.
                 db.delete(attempt)
                 task.status = "PENDING"
+                step.current_attempt_id = None
                 service._record(task_id, "task.dispatch_failed", step_id=step.step_id, payload={"reason": "device_offline"})
                 db.commit()
                 return False
@@ -115,6 +151,8 @@ class TaskDispatcher:
             attempt.dispatch_message_id = envelope.id
             task.status = "SENT"
             task.timeout_at = utcnow() + timedelta(seconds=int(command.timeout))
+            # V1.1 §14: the timeout is bound to THIS attempt, not just the task.
+            attempt.timeout_at = task.timeout_at
             service._record(
                 task_id, "task.sent", step_id=step.step_id, attempt_id=attempt.attempt_id,
                 payload={"message_id": envelope.id, "connections": sent},

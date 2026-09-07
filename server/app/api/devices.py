@@ -54,7 +54,7 @@ def device_uuid_suffix() -> str:
     return uuid.uuid4().hex[:6]
 
 
-@router.get("/devices", response_model=list[DeviceOut])
+@router.get("/devices", response_model=list[DeviceOut], dependencies=[Depends(require_admin)])
 def list_devices(request: Request, db: Session = Depends(get_db)):
     hub = request.app.state.hub
     service = DeviceService(db)
@@ -74,7 +74,7 @@ def get_device(device_id: str, request: Request, db: Session = Depends(get_db)):
     return DeviceService(db).to_out(device, connection_count=hub.connection_count(device.device_id))
 
 
-@router.post("/devices/{device_id}/revoke", response_model=DeviceOut)
+@router.post("/devices/{device_id}/revoke", response_model=DeviceOut, dependencies=[Depends(require_admin)])
 async def revoke_device(device_id: str, request: Request, db: Session = Depends(get_db)):
     hub = request.app.state.hub
     try:

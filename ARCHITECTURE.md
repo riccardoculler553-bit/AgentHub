@@ -1,8 +1,8 @@
-# AgentHub V1.0 开发架构文档（当前实现快照）
+# AgentHub 开发架构文档（当前实现快照 · V1.1 Reliable-1.0）
 
-> 版本：AgentHub V1.0 + MVP-Real-1.0 + Routing-1.0（底层 DeviceLink V1.0 已含 2026-09-05 公网架构调整）· 更新日期：2026-09-07（晚）
-> 测试基线：`pytest tests/` → **64 passed**（unit / integration / agenthub 验收 / MVP / 影刀执行器 / 路由）
-> 里程碑：**MVP 已全链路实机跑通**（钉钉群 @机器人 → GLM 意图分析 → 设备路由 → 子电脑影刀执行 → 日志级完成判定 → 群内回复），见 §16。
+> 版本：AgentHub V1.0 + V1.1 Reliable-1.0 + MVP-Real-1.0 + Routing-1.0（底层 DeviceLink V1.0 已含 2026-09-05 公网架构调整）· 更新日期：2026-09-07（晚）
+> 测试基线：`pytest tests/` → **85 passed**（unit / integration / agenthub 验收 / MVP / 影刀执行器 / 路由 / V1.1 可靠性矩阵 / 状态机）
+> 里程碑：**MVP 已全链路实机跑通**（钉钉群 @机器人 → GLM 意图分析 → 设备路由 → 子电脑影刀执行 → 日志级完成判定 → 群内回复，见 §16）；**V1.1 可靠性执行落地**（状态机终态保护 / CAS 原子抢单 / 过期事件门 / 消息幂等 / 重启恢复，见 §17）。
 
 AgentHub 是构建在 DeviceLink（多设备 WebSocket 注册与连接管理平台）之上的**任务控制与智能编排层**：Admin/主 Agent 把自然语言或结构化请求转化为任务（Task），经命令注册表（Command Registry）与能力注册表（Capability Registry）双重校验后，通过 DeviceLink 长连接派发到指定子电脑的 Worker 执行，回报结果、支持多步串行、自动重试、超时看门狗、取消与离线重派。
 
@@ -59,7 +59,9 @@ Websocket/
 │   ├── alembic.ini
 │   ├── migrations/versions/
 │   │   ├── 0001_initial_tables.py     # DeviceLink 5 张表
-│   │   └── 0002_agenthub_tables.py    # AgentHub 5 张表（commands/capabilities/tasks…）
+│   │   ├── 0002_agenthub_tables.py    # AgentHub 6 张表（commands/capabilities/tasks…）
+│   │   ├── 0003_agent_runs.py         # MVP agent_runs 表
+│   │   └── 0004_v1_1_reliable_execution.py  # V1.1：task_steps.current_attempt_id / task_attempts.timeout_at / agent_runs 幂等唯一键
 │   └── app/
 │       ├── main.py                    # FastAPI 应用 + lifespan（启动两个后台监控循环）
 │       ├── core/
@@ -92,9 +94,10 @@ Websocket/
 │       │   ├── db_models.py           # tasks/task_steps/task_attempts/task_events
 │       │   ├── models.py              # Pydantic API 模型
 │       │   ├── errors.py              # TaskError 族（状态码映射）
-│       │   ├── service.py             # 生命周期 + 设备事件账本
-│       │   ├── dispatcher.py          # 派发器（attempt 创建/信封组装）
-│       │   ├── monitor.py             # 后台循环：PENDING 重派 + 超时看门狗
+│       │   ├── state.py               # V1.1 状态机：Task/Attempt 转移表 + 终态集合 + can_transition
+│       │   ├── service.py             # 生命周期 + 设备事件账本（事件门序见 §17.2）
+│       │   ├── dispatcher.py          # 派发器（attempt 创建/信封组装 + CAS 原子抢单，§17.3）
+│       │   ├── monitor.py             # 后台循环：PENDING 重派 + 超时看门狗 + 重启恢复（§17.6）
 │       │   └── device_link.py         # AgentHub ↔ DeviceLink 唯一缝隙
 │       ├── agent/                     # Main Agent（LangGraph，完整规划式，§10）
 │       │   ├── state.py               # AgentState（图内飞行状态，≠ DB 任务状态）
@@ -167,7 +170,7 @@ Internet ──HTTPS/WSS──> 公网暴露层 ──────> DeviceLink/A
 - Device ≠ Connection：一台设备可同时持有多条连接（多开/重连竞态），在线状态按设备聚合。
 - Worker 双向能力：连接建立后立即上报 `device.capabilities`；断线由 `ReconnectManager` 指数退避重连。
 
-## 5. 数据模型（10 张表）
+## 5. 数据模型（12 张表）
 
 ### DeviceLink 层（迁移 0001）
 
@@ -186,10 +189,10 @@ Internet ──HTTPS/WSS──> 公网暴露层 ──────> DeviceLink/A
 | `commands` | **Command Registry**：command_name(唯一)/version/executor_type/executor_config/params_schema/timeout/enabled。定义“系统允许执行什么”，不含实现 |
 | `device_capabilities` | **Capability Registry**：device_id + command_name（唯一约束）+ version/enabled。设备上报，整体替换（幂等） |
 | `tasks` | 任务：task_id/name/created_by/target_device_id/status/priority/max_attempts/timeout_at |
-| `task_steps` | 步骤：task_id + order_no + command + params(JSON) + status；V1.0 继承任务 target_device_id（列保留给未来跨设备工作流） |
-| `task_attempts` | 尝试账本：task_id + step_id + attempt_no + status + dispatch_message_id + error_code/message。每次派发/重试都新增一行 |
+| `task_steps` | 步骤：task_id + order_no + command + params(JSON) + status；V1.0 继承任务 target_device_id（列保留给未来跨设备工作流）。**V1.1 增列 `current_attempt_id`**：该步骤当前有效尝试，过期事件门（§17.2）据此判定 |
+| `task_attempts` | 尝试账本：task_id + step_id + attempt_no + status + dispatch_message_id + error_code/message。每次派发/重试都新增一行。**V1.1 增列 `timeout_at`**：看门狗与结果竞速的判定时钟 |
 | `task_events` | 全生命周期事件流：task/step/attempt + event_type + payload。供 Dashboard Timeline / 审计 / Agent 状态恢复 |
-| `agent_runs` | **AgentRun**（MVP）：一次用户请求一行 —— run_id/channel/conversation_id/message_id/input_text/status(RUNNING/SUCCESS/FAILED)/task_id/ack_reply/final_reply/reply_webhook/error/created_at/finished_at。Run ≠ Task：一轮对话一个 Run，业务执行一个 Task；Run 是会话轮次审计（可扇出多 Task），Task 活过服务重启。回复**先落库再推送**，sender 故障不丢记录 |
+| `agent_runs` | **AgentRun**（MVP）：一次用户请求一行 —— run_id/channel/conversation_id/message_id/input_text/status(RUNNING/SUCCESS/FAILED)/task_id/ack_reply/final_reply/reply_webhook/error/created_at/finished_at。Run ≠ Task：一轮消息一个 Run，业务执行一个 Task；Run 是会话轮次审计（可扇出多 Task），Task 活过服务重启。回复**先落库再推送**，sender 故障不丢记录。**V1.1：`UNIQUE(channel, message_id)` 幂等键**（API 通道 message_id 存 NULL 豁免唯一约束，迁移 0004 先清空历史空串） |
 
 **状态机**（Task）：`PENDING → DISPATCHING → SENT → ACCEPTED → RUNNING → SUCCESS / FAILED / TIMEOUT / CANCELLED`
 （Step：PENDING/RUNNING/…；Attempt：DISPATCHING/SENT/ACCEPTED/RUNNING/…）
@@ -413,15 +416,17 @@ Admin 鉴权：请求头 `X-Admin-Token` 对比 `AGENTHUB_ADMIN_TOKEN`；为空 
 - **幂等性**：重复派发不重复执行（Worker 去重）；能力整体替换幂等。
 - **网络**：服务只绑 127.0.0.1，公网经 Tailscale Funnel（WireGuard 加密隧道）。
 
-## 14. 测试体系（64 passed）
+## 14. 测试体系（85 passed）
 
 | 层 | 文件 | 覆盖 |
 | --- | --- | --- |
 | unit | test_protocol / test_reconnect / test_registration_service / test_token | 信封解析、指数退避、一次性码生命周期、Token 哈希 |
+| unit | test_task_state_machine | V1.1 状态机：全部合法转移接受、非法转移拒绝、终态集合封闭性 |
 | integration | test_registration_flow / test_websocket_flow | 注册→连接→心跳→撤销全流程 |
 | agenthub | test_acceptance / test_agent | **验收**：多设备隔离（B 永远收不到 A 的任务）、离线重派、重复派发幂等、重试 attempts 账本与 409、规则规划器 |
 | agenthub | test_tools | AgentTool 注册表（加载/校验/重载）+ 意图分析（规则模式：关键词、设备名最长匹配、不支持意图） |
 | agenthub | test_mvp | **MVP 验收**：成功链路（ack/final 回复 + attempt_id 三元组）、未知设备、离线、忙设备、忙跃迁路由、不支持意图 |
+| agenthub | test_reliability | **V1.1 可靠性矩阵（§17.7）**：CAS 抢单唯一胜者、过期 attempt 事件仅审计、TIMEOUT/CANCELLED 后迟到 SUCCESS 不复活、结果-看门狗竞速唯一胜者、AgentRun message_id 幂等、Device API 鉴权、多连接聚合在线、重启恢复 |
 | agenthub | test_yingdao_executor | 影刀执行管线：忙门（EXECUTOR_BUSY）、启动确认重试、**日志 end 标记完成判定**、超时终止、取消 |
 | agenthub | test_busy_check | 日志标记扫描（start/end 时间戳解析、task_end_seen 判定边界） |
 
@@ -582,3 +587,96 @@ Admin 鉴权：请求头 `X-Admin-Token` 对比 `AGENTHUB_ADMIN_TOKEN`；为空 
 | 子电脑（办公室电脑02） | 安装 Python 3.11+ 与影刀；`client/worker/capabilities.json` 填真实 `robot_uuid`/`shadowbot_path`（**路径用双反斜杠或正斜杠**，单反斜杠会 JSON 解析失败→能力上报为空→静默故障）；`python main.py --code <注册码> --name 办公室电脑02` 注册并常驻 |
 | 钉钉开放平台 | 企业内部应用，开通机器人能力，Stream 模式（无需公网回调），可见范围覆盖目标群成员 |
 | 公网分享 | `tailscale funnel 8000`（可选）；Dashboard 受 `AGENTHUB_ADMIN_TOKEN` 保护 |
+
+---
+
+## 17. V1.1 可靠性执行（Reliable-1.0）
+
+> 目标：把「任务只会被一个调度器派发、一个执行者回报、终态不可逆、消息不重复消费」从约定变成**由状态机与 CAS 强制**的机制。规格见 `docs/V1.1_PLAN.md`。
+
+### 17.1 双状态机（task/state.py）
+
+```python
+TASK_TRANSITIONS = {
+    "PENDING":     {"DISPATCHING", "CANCELLED", "TIMEOUT"},
+    "DISPATCHING": {"SENT", "PENDING", "CANCELLED", "FAILED"},   # PENDING: 发送失败回滚
+    "SENT":        {"ACCEPTED", "RUNNING", "SUCCESS", "FAILED", "CANCELLED", "TIMEOUT"},
+    "ACCEPTED":    {"RUNNING", "SUCCESS", "FAILED", "CANCELLED", "TIMEOUT"},
+    "RUNNING":     {"SUCCESS", "FAILED", "CANCELLED", "TIMEOUT"},
+    "SUCCESS": set(), "FAILED": set(), "CANCELLED": set(), "TIMEOUT": set(),   # 终态封闭
+}
+# ATTEMPT_TRANSITIONS 同构，另含 TIMEOUT→FAILED 的 retry 重开由 request_retry 显式重置
+```
+
+- `can_transition(kind, from, to)` 是唯一的状态变更裁判（unit 级全组合覆盖）。
+- 终态集合 `TASK_TERMINAL_STATES / ATTEMPT_TERMINAL_STATES` 从转移表推导，天然一致。
+
+### 17.2 设备事件门序（TaskService.handle_device_event）
+
+设备回报按以下顺序过闸，**任何一闸拒绝都只记审计事件、绝不改状态**：
+
+| 闸 | 规则 | 违例审计事件 |
+| --- | --- | --- |
+| 1. 归属 | attempt.device_id ≠ 上报设备 → 直接忽略 | （无事件，安全边界） |
+| 2. 过期 | 事件带的 attempt_id ≠ step.current_attempt_id → 仅审计 | `task.late_event{reason: stale_attempt}` |
+| 3. 终态 | 任务已终态（SUCCESS/FAILED/CANCELLED/TIMEOUT）→ 尝试结果按事实记账（若转移合法），任务不复活 | `task.late_result{reason: task_terminal}` |
+| 4. 状态机 | `can_transition` 拒绝非法转移 → 仅审计 | `task.late_result{reason: illegal_transition}` |
+| 5. 落账 | 记 `task_events`（始终带 attempt_id）→ commit → task_waiters 唤醒 | — |
+
+- `task.result{success}` 成功路径：先置 step SUCCESS 并 **`db.flush()`**（SessionLocal 是 `autoflush=False`，不 flush 则 `next_pending_step` 查询看不见刚关闭的步骤 → 多步误报 advance）。
+- `advance=True` 语义 = 「存在后续 PENDING 步骤，需要派发下一步」，由 API/WS 层异步触发 Dispatcher。
+
+### 17.3 Dispatcher CAS 原子抢单
+
+```python
+claimed = db.query(Task).filter(
+    Task.task_id == task_id, Task.status == "PENDING"
+).update({"status": "DISPATCHING"}, synchronize_session=False)
+if claimed != 1:
+    return False   # 另一个调度器已赢
+```
+
+- 条件 UPDATE 是数据库层原子操作：两个调度器并发派发同一任务，恰好一个 `claimed==1`（测试用 `asyncio.gather` 强制交错验证）。
+- 发送失败（0 连接/竞态掉线）→ 回滚 attempt、任务回 PENDING，Monitor 兜底重派。
+
+### 17.4 结果-看门狗竞速（单胜者）
+
+`TaskService.timeout_running` 双 CAS：
+
+1. **Attempt CAS**：`UPDATE task_attempts SET status='TIMEOUT' WHERE attempt_id=? AND status IN (LIVE)` → 只有关在此刻仍活跃的尝试能被判超时；
+2. **Task CAS**：`UPDATE tasks SET status='TIMEOUT' WHERE task_id=? AND status IN (LIVE)` → 结果回报与看门狗并发时**恰好一方赢**：
+   - 结果先到 → 任务 SUCCESS；看门狗 CAS 0 行 → `notify_device=False`、状态原样返回（不产生第二个终态事件）；
+   - 看门狗先到 → 任务 TIMEOUT；迟到的 SUCCESS 落入 §17.2 终态闸 → `task.late_result`，任务不复活。
+
+### 17.5 AgentRun 消息幂等（UNIQUE(channel, message_id)）
+
+- 迁移 0004：`UPDATE agent_runs SET message_id = NULL WHERE message_id = ''` + `UNIQUE(channel, message_id)`；
+- 钉钉/API 重放或重试同一 `message_id` → 命中唯一键 → 返回**已有 run_id**（同轮消息不二次执行）；
+- API 直连通道无 message_id → 存 NULL（SQLAlchemy 唯一约束对 NULL 不生效，每条自成 Run）。
+
+### 17.6 服务器重启恢复
+
+`TaskMonitor.recover_stuck_dispatching()`（启动时、Monitor 循环前执行）：
+
+- `DISPATCHING` 任务 = 「CAS 抢单后、发送确认前崩溃」的僵尸态 → 任务回 `PENDING`，其 `DISPATCHING` attempt 置 `FAILED(error_code=SERVER_RESTART)`，记 `task.recovered` 事件，Monitor 随后正常重派；
+- `SENT/ACCEPTED/RUNNING` 等已送达状态不动，由超时看门狗按 `timeout_at` 收敛。
+
+### 17.7 设备在线语义与 Admin 鉴权加固
+
+- **在线 = hub 实时连接数 > 0**（`DeviceService.to_out`，V1.1 §38 多连接聚合）：DB `devices.status` 是 HeartbeatMonitor 宽限期（45s）的滞后视图，不再作为 API 的在线判据 —— 一台设备两条连接，断一条仍在线（`connection_count` 同源）。
+- **Device API 全部管理面护栏**：`GET /api/devices`（列表）补上 `require_admin`（此前漏护）；注册码创建 / 任务 / Agent / 能力查询路由级护栏在位。`AGENTHUB_ADMIN_TOKEN` 为空 = 开放模式（本机开发）。
+
+### 17.8 可靠性测试矩阵（tests/agenthub/test_reliability.py + unit）
+
+| 用例 | 验证点 |
+| --- | --- |
+| test_cas_claim_admits_exactly_one_dispatcher | 双调度器竞速 → 恰一个 `task.dispatching` 事件，任务回 PENDING 无残留 attempt |
+| test_dispatch_to_online_device_creates_single_attempt | 全链路单尝试单派发（Monitor 扫描周期不重复派） |
+| test_late_success_after_timeout_stays_timeout | TIMEOUT 后迟到 SUCCESS：任务不复活，`late_result{task_terminal}` |
+| test_late_success_after_cancel_keeps_cancelled | 取消赢竞速 → CANCELLED 永久 |
+| test_result_beats_watchdog_single_winner | 结果先到 → SUCCESS；看门狗 CAS no-op |
+| test_stale_attempt_event_is_audit_only | 非当前 attempt 事件零状态变更 |
+| test_agentrun_same_message_id_same_run / empty_message_id_never_collides | 消息幂等 / NULL 豁免 |
+| test_device_api_requires_admin | 列表/撤销 401/200 边界 |
+| test_multi_connection_device_stays_online | 双连接断一仍在线（count=1），全断离线 |
+| test_server_restart_recovers_stuck_dispatching | DISPATCHING 僵尸恢复 → PENDING + SERVER_RESTART 账本 |

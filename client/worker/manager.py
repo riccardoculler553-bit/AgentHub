@@ -91,6 +91,34 @@ class TaskManager:
             # by falling back to the step key.
             attempt_id = f"legacy-{task_id}-{step_id}"
 
+        # V1.1 §12/§55.9: the active-execution check MUST run before the
+        # ledger claim - claiming a different attempt while one is live would
+        # create an orphan ledger row and an "ACCEPTED but never runs" state.
+        active = self._active.get((task_id, step_id))
+        if active is not None:
+            if attempt_id and active["attempt_id"] != attempt_id:
+                # A new attempt arrived while the old one still runs (e.g. the
+                # server watchdog fired mid-execution). Never claim/execute it:
+                # echo the ACTIVE attempt so the server keeps its real context.
+                logger.warning(
+                    "dispatch %s ignored: %s/%s still active as attempt %s",
+                    attempt_id, task_id, step_id, active["attempt_id"],
+                )
+                await self._report(
+                    "task.running",
+                    {"task_id": task_id, "step_id": step_id, "attempt_id": active["attempt_id"]},
+                )
+                return
+            # Duplicate of the active attempt -> idempotent report, no re-run.
+            logger.warning(
+                "duplicate dispatch for %s/%s (already %s)", task_id, step_id, active["status"]
+            )
+            await self._report(
+                "task.running",
+                {"task_id": task_id, "step_id": step_id, "attempt_id": active["attempt_id"]},
+            )
+            return
+
         previous = self.ledger.claim(task_id, step_id, attempt_id, command)
         if previous is not None:
             # Idempotency (PDF §75/§119): duplicate dispatch -> never re-execute.
@@ -109,15 +137,6 @@ class TaskManager:
                     "task.running",
                     {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id},
                 )
-            return
-
-        if (task_id, step_id) in self._active:
-            state = self._active[(task_id, step_id)]
-            logger.warning("duplicate dispatch for %s/%s (already %s)", task_id, step_id, state["status"])
-            await self._report(
-                "task.running",
-                {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id},
-            )
             return
 
         executor = self.registry.get(command)

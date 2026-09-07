@@ -136,8 +136,15 @@ class FakeWorker:
 
 
 def register_device(client, name: str) -> dict:
-    """Create a registration code and register a device; returns the token payload."""
-    code = client.post("/api/device-registration", json={"device_name": name}).json()["code"]
+    """Create a registration code and register a device; returns the token payload.
+
+    Sends the admin token when one is configured (tests that harden admin auth)."""
+    from app.core.config import settings
+
+    headers = {"X-Admin-Token": settings.admin_token} if settings.admin_token else {}
+    code = client.post(
+        "/api/device-registration", json={"device_name": name}, headers=headers
+    ).json()["code"]
     res = client.post(
         "/api/devices/register",
         json={

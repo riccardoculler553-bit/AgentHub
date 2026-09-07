@@ -120,3 +120,43 @@ def test_manager_never_reruns_finished_attempt(tmp_path):
         assert results[-1]["data"]["status"] == "success"
     finally:
         led.close()
+
+
+def test_manager_ignores_new_attempt_while_old_still_active(tmp_path):
+    """V1.1 §12/§55.9: a different attempt arriving while attempt 1 is live
+    must NOT be claimed (no orphan ledger row) and must NOT be executed - the
+    worker echoes the ACTIVE attempt so the server keeps its real context."""
+
+    led = ExecutionLedger(tmp_path / "worker.db")
+    try:
+        manager = TaskManager(ledger=led)
+        ws = RecordingClient()
+
+        def dispatch(attempt_id: str) -> dict:
+            return {
+                "id": attempt_id, "type": "task.dispatch", "version": 1, "timestamp": 1,
+                "data": {"task_id": "task_r", "step_id": "step_r", "attempt_id": attempt_id,
+                         "command": "echo", "params": {"message": "hi"}, "timeout": 30},
+            }
+
+        async def scenario():
+            manager.bind(ws)
+            await manager.on_dispatch(dispatch("attempt_1"))
+            # attempt_2 arrives BEFORE attempt_1 finished (still in _active)
+            await manager.on_dispatch(dispatch("attempt_2"))
+            await manager._queue.join()
+            await manager.on_dispatch(dict(dispatch("attempt_1")))  # late duplicate
+            await manager._queue.join()
+
+        asyncio.run(scenario())
+        accepted = [e for e in ws.sent if e["type"] == "task.accept"]
+        assert len(accepted) == 1 and accepted[0]["data"]["attempt_id"] == "attempt_1"
+        # every running echo references the ACTIVE attempt, never attempt_2
+        runnings = [e for e in ws.sent if e["type"] == "task.running"]
+        assert runnings and all(r["data"]["attempt_id"] == "attempt_1" for r in runnings)
+        # no orphan ledger claim for attempt_2 - it never existed locally
+        assert led.get("attempt_2") is None
+        results = [e for e in ws.sent if e["type"] == "task.result"]
+        assert all(r["data"]["attempt_id"] == "attempt_1" for r in results)
+    finally:
+        led.close()

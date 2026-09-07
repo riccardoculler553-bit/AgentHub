@@ -20,13 +20,16 @@ from app.device.service import DeviceService
 from app.task.db_models import Task, TaskAttempt, TaskEvent, TaskStep
 from app.task.errors import InvalidTaskState, TaskNotFound, TaskValidationFailed
 from app.task.models import TaskCreateIn
+from app.task.state import ATTEMPT_TERMINAL_STATES, TASK_TERMINAL_STATES, can_transition
 from app.task.waiters import task_waiters
 
-TERMINAL_TASK_STATES = {"SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"}
 # Task statuses that mean "a dispatch may be flying / worker may still be alive"
 LIVE_TASK_STATES = {"DISPATCHING", "SENT", "ACCEPTED", "RUNNING"}
+LIVE_ATTEMPT_STATES = {"DISPATCHING", "SENT", "ACCEPTED", "RUNNING"}
 CANCELABLE_TASK_STATES = {"PENDING", "DISPATCHING", "SENT", "ACCEPTED", "RUNNING"}
 RETRYABLE_TASK_STATES = {"FAILED", "TIMEOUT"}
+# Backwards-compatible alias (state.py is the source of truth in V1.1).
+TERMINAL_TASK_STATES = TASK_TERMINAL_STATES
 
 
 def _new_id(prefix: str) -> str:
@@ -170,7 +173,16 @@ class TaskService:
     # ------------------------------------------------------- device-side events
 
     def handle_device_event(self, device_id: str, msg_type: str, data: dict) -> dict:
-        """Apply task.accept/running/progress/result from a Worker.
+        """Apply task.accept/running/progress/result from a Worker (V1.1 §8/§33).
+
+        Event gate order:
+        1. resolve Task / Step / Attempt
+        2. security: a device may only report attempts dispatched to it
+        3. stale gate: an event naming a non-current attempt is AUDIT ONLY
+           (recorded with attempt_id, never mutates Task/Step/Attempt state)
+        4. terminal gate: a terminal Task can never be reopened by an event
+        5. state machine gate: only legal transitions are applied
+        6. record event (always, with attempt_id) -> commit -> wake waiters
 
         Returns {"task_id", "advance"} where advance=True means the next step
         should be dispatched (the caller triggers the Dispatcher)."""
@@ -186,13 +198,14 @@ class TaskService:
 
         attempt = None
         if attempt_id:
-            # Prefer exact attempt matching (idempotency + late results).
+            # Exact attempt matching (idempotency + late results).
             attempt = self.db.scalars(
                 select(TaskAttempt).where(
                     TaskAttempt.attempt_id == attempt_id, TaskAttempt.task_id == task_id
                 )
             ).first()
         if attempt is None:
+            # Legacy senders without attempt_id keep the latest-open fallback.
             attempt = self.latest_open_attempt(task_id, step_id)
         if attempt is not None and attempt.device_id not in (None, device_id):
             # A device may only report its own attempts (security boundary).
@@ -201,31 +214,56 @@ class TaskService:
         now = utcnow()
         advance = False
 
+        # --- stale gate (V1.1 §7/§8): report against an old attempt = audit only
+        if attempt_id is not None and step.current_attempt_id != attempt_id:
+            self._record(
+                task_id, "task.late_event", step_id=step_id, attempt_id=attempt_id,
+                payload={"event": msg_type, "reason": "stale_attempt",
+                         "current_attempt_id": step.current_attempt_id},
+            )
+            self.db.commit()
+            return {"task_id": task_id, "advance": False}
+
+        # --- terminal gate (V1.1 §6): terminal tasks are never reopened
+        if task.status in TERMINAL_TASK_STATES:
+            payload = {"event": msg_type, "reason": "task_terminal", "task_status": task.status}
+            if msg_type == "task.result":
+                payload["result_status"] = str(data.get("status", "failed")).lower()
+                # The attempt keeps its factual outcome when the transition is
+                # legal (RUNNING -> SUCCESS); an already-terminal attempt
+                # (e.g. TIMEOUT) is never flipped (state machine rejects it).
+                if attempt is not None and self._apply_attempt_result(attempt, data, now):
+                    payload["attempt_status"] = attempt.status
+            self._record(task_id, "task.late_result", step_id=step_id, attempt_id=attempt_id, payload=payload)
+            self.db.commit()
+            return {"task_id": task_id, "advance": False}
+
         if msg_type == "task.accept":
-            if attempt is not None and attempt.status in ("DISPATCHING", "SENT"):
+            if attempt is not None and can_transition("attempt", attempt.status, "ACCEPTED"):
                 attempt.status = "ACCEPTED"
                 attempt.accepted_at = now
-            if task.status in ("DISPATCHING", "SENT"):
+            if can_transition("task", task.status, "ACCEPTED"):
                 task.status = "ACCEPTED"
-            self._record(task_id, "task.accepted", step_id=step_id)
+            self._record(task_id, "task.accepted", step_id=step_id, attempt_id=attempt_id)
 
         elif msg_type == "task.running":
-            if attempt is not None and attempt.status in ("DISPATCHING", "SENT", "ACCEPTED"):
+            if attempt is not None and can_transition("attempt", attempt.status, "RUNNING"):
                 attempt.status = "RUNNING"
                 attempt.started_at = now
-            if step.status in ("PENDING",):
-                step.status = "RUNNING"
-                step.started_at = now
-            if task.status in ("DISPATCHING", "SENT", "ACCEPTED"):
+            if can_transition("task", task.status, "RUNNING"):
                 task.status = "RUNNING"
                 task.started_at = now
-            self._record(task_id, "task.running", step_id=step_id)
+            if step.status == "PENDING":
+                step.status = "RUNNING"
+                step.started_at = now
+            self._record(task_id, "task.running", step_id=step_id, attempt_id=attempt_id)
 
         elif msg_type == "task.progress":
             self._record(
                 task_id,
                 "task.progress",
                 step_id=step_id,
+                attempt_id=attempt_id,
                 payload={"progress": data.get("progress"), "message": data.get("message")},
             )
 
@@ -234,46 +272,54 @@ class TaskService:
             error = data.get("error") or {}
             result = data.get("result") or {}
             if result_status == "success":
-                if attempt is not None:
-                    attempt.status = "SUCCESS"
-                    attempt.finished_at = now
+                self._apply_attempt_result(attempt, data, now)
                 step.status = "SUCCESS"
                 step.finished_at = now
-                if task.status == "CANCELLED":
-                    # Late result for an already cancelled task: keep CANCELLED.
-                    self._record(task_id, "task.cancelled", step_id=step_id, payload={"late_result": True})
-                elif self.next_pending_step(task_id) is not None:
+                # autoflush=False: make the just-closed step visible to the
+                # next_pending_step query below (SQLite/MySQL alike).
+                self.db.flush()
+                if self.next_pending_step(task_id) is not None:
                     advance = True
-                    task.status = "RUNNING"
-                    self._record(task_id, "task.progress", step_id=step_id, payload={"step_result": result, "step_status": "success"})
+                    if can_transition("task", task.status, "RUNNING"):
+                        task.status = "RUNNING"
+                    self._record(task_id, "task.progress", step_id=step_id, attempt_id=attempt_id,
+                                 payload={"step_result": result, "step_status": "success"})
                 else:
-                    task.status = "SUCCESS"
-                    task.finished_at = now
-                    self._record(task_id, "task.success", step_id=step_id, payload={"result": result})
+                    if can_transition("task", task.status, "SUCCESS"):
+                        task.status = "SUCCESS"
+                        task.finished_at = now
+                        self._record(task_id, "task.success", step_id=step_id, attempt_id=attempt_id, payload={"result": result})
+                    else:
+                        # Illegal (e.g. task CANCELLED mid-flight): audit only.
+                        self._record(task_id, "task.late_result", step_id=step_id, attempt_id=attempt_id,
+                                     payload={"reason": "illegal_transition", "task_status": task.status})
             elif result_status == "cancelled":
-                if attempt is not None and attempt.status not in TERMINAL_TASK_STATES:
+                if attempt is not None and can_transition("attempt", attempt.status, "CANCELLED"):
                     attempt.status = "CANCELLED"
                     attempt.finished_at = now
-                step.status = "CANCELLED"
-                step.finished_at = now
-                if task.status != "CANCELLED":
+                if step.status not in ("SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"):
+                    step.status = "CANCELLED"
+                    step.finished_at = now
+                if can_transition("task", task.status, "CANCELLED"):
                     task.status = "CANCELLED"
                     task.finished_at = now
-                self._record(task_id, "task.cancelled", step_id=step_id, payload={"by": "worker"})
+                self._record(task_id, "task.cancelled", step_id=step_id, attempt_id=attempt_id, payload={"by": "worker"})
             else:  # failed
                 error_code = str(error.get("code", "EXECUTOR_FAILED"))[:64]
                 error_message = str(error.get("message", ""))[:500]
-                if attempt is not None and attempt.status not in TERMINAL_TASK_STATES:
+                if attempt is not None and can_transition("attempt", attempt.status, "FAILED"):
                     attempt.status = "FAILED"
                     attempt.finished_at = now
                     attempt.error_code = error_code
                     attempt.error_message = error_message
-                step.status = "FAILED"
-                step.finished_at = now
-                if task.status != "CANCELLED":
+                if step.status not in ("SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"):
+                    step.status = "FAILED"
+                    step.finished_at = now
+                if can_transition("task", task.status, "FAILED"):
                     task.status = "FAILED"
                     task.finished_at = now
-                self._record(task_id, "task.failed", step_id=step_id, payload={"error_code": error_code, "error_message": error_message})
+                self._record(task_id, "task.failed", step_id=step_id, attempt_id=attempt_id,
+                             payload={"error_code": error_code, "error_message": error_message})
         else:
             return {"task_id": task_id, "advance": False}
 
@@ -282,6 +328,23 @@ class TaskService:
             # Wake in-process waiters (MVP agent) - DB polling stays as fallback.
             task_waiters.notify(task_id)
         return {"task_id": task_id, "advance": advance}
+
+    def _apply_attempt_result(self, attempt: TaskAttempt | None, data: dict, now) -> bool:
+        """Apply the factual result to the attempt when the state machine
+        allows it. Returns True when the attempt status was changed."""
+        if attempt is None:
+            return False
+        result_status = str(data.get("status", "failed")).lower()
+        target = {"success": "SUCCESS", "cancelled": "CANCELLED"}.get(result_status, "FAILED")
+        if not can_transition("attempt", attempt.status, target):
+            return False
+        attempt.status = target
+        attempt.finished_at = now
+        if target == "FAILED":
+            error = data.get("error") or {}
+            attempt.error_code = str(error.get("code", "EXECUTOR_FAILED"))[:64]
+            attempt.error_message = str(error.get("message", ""))[:500]
+        return True
 
     # ------------------------------------------------------- admin-side actions
 
@@ -317,6 +380,8 @@ class TaskService:
             raise InvalidTaskState(task_id, task.status, f"retry (max_attempts={task.max_attempts} reached)")
         step.status = "PENDING"
         step.finished_at = None
+        # V1.1: the re-created attempt becomes the new current context.
+        step.current_attempt_id = None
         task.status = "PENDING"
         task.finished_at = None
         task.timeout_at = None
@@ -325,29 +390,54 @@ class TaskService:
         return {"task_id": task_id, "status": task.status}
 
     def timeout_running(self, task: Task) -> dict:
-        """Server-side watchdog: a live task past timeout_at becomes TIMEOUT."""
+        """Server-side watchdog: a live task past timeout_at becomes TIMEOUT
+        (V1.1 §14/§15: conditional updates - whoever wins the CAS closes the
+        task; a concurrent task.result then lands in the late-result lane)."""
         now = utcnow()
-        if task.status in ("SENT", "ACCEPTED", "RUNNING"):
-            attempt = None
-            for step in self.get_steps(task.task_id):
-                if step.status in ("RUNNING", "PENDING"):
-                    open_attempt = self.latest_open_attempt(task.task_id, step.step_id)
-                    if open_attempt is not None and open_attempt.status not in TERMINAL_TASK_STATES:
-                        attempt = open_attempt
-                        break
-            if attempt is not None:
-                attempt.status = "TIMEOUT"
-                attempt.finished_at = now
-                attempt.error_code = "EXECUTOR_TIMEOUT"
-                step = self.db.scalars(select(TaskStep).where(TaskStep.step_id == attempt.step_id)).first()
-                if step is not None and step.status == "RUNNING":
+        attempt_id = step_id = None
+        # CAS the attempt: only a live attempt may be closed as TIMEOUT.
+        for step in self.get_steps(task.task_id):
+            if step.status not in ("RUNNING", "PENDING"):
+                continue
+            open_attempt = self.latest_open_attempt(task.task_id, step.step_id)
+            if open_attempt is None or open_attempt.status not in LIVE_ATTEMPT_STATES:
+                continue
+            updated = (
+                self.db.query(TaskAttempt)
+                .filter(
+                    TaskAttempt.attempt_id == open_attempt.attempt_id,
+                    TaskAttempt.status.in_(LIVE_ATTEMPT_STATES),
+                )
+                .update(
+                    {"status": "TIMEOUT", "finished_at": now, "error_code": "EXECUTOR_TIMEOUT"},
+                    synchronize_session=False,
+                )
+            )
+            if updated:
+                attempt_id, step_id = open_attempt.attempt_id, open_attempt.step_id
+                if step.status == "RUNNING":
                     step.status = "TIMEOUT"
                     step.finished_at = now
-            task.status = "TIMEOUT"
-            task.finished_at = now
-            self._record(task.task_id, "task.timeout", payload={"reason": "timeout_at elapsed"})
-            self.db.commit()
-        return {"task_id": task.task_id, "status": task.status, "notify_device": True}
+                break
+        # CAS the task: exactly one watchdog/result path closes it.
+        updated_task = (
+            self.db.query(Task)
+            .filter(Task.task_id == task.task_id, Task.status.in_(LIVE_TASK_STATES))
+            .update({"status": "TIMEOUT", "finished_at": now}, synchronize_session=False)
+        )
+        if updated_task:
+            self._record(
+                task.task_id, "task.timeout", step_id=step_id, attempt_id=attempt_id,
+                payload={"reason": "timeout_at elapsed"},
+            )
+        self.db.commit()
+        return {
+            "task_id": task.task_id,
+            "status": "TIMEOUT" if updated_task else task.status,
+            "notify_device": bool(updated_task),
+            "attempt_id": attempt_id,
+            "step_id": step_id,
+        }
 
     def timeout_pending(self, task: Task) -> dict:
         """Device stayed offline longer than the max wait: PENDING -> TIMEOUT."""
@@ -357,6 +447,15 @@ class TaskService:
             self._record(task.task_id, "task.timeout", payload={"reason": "device_offline_max_wait"})
             self.db.commit()
         return {"task_id": task.task_id, "status": task.status, "notify_device": False}
+
+    def _current_attempt_ids(self, task_id: str) -> tuple[str | None, str | None]:
+        """(attempt_id, step_id) of the live attempt a cancel envelope should
+        address (V1.1 §16: cancel is bound to the current attempt)."""
+        for step in self.get_steps(task_id):
+            open_attempt = self.latest_open_attempt(task_id, step.step_id)
+            if open_attempt is not None and open_attempt.status in LIVE_ATTEMPT_STATES:
+                return open_attempt.attempt_id, step.step_id
+        return None, None
 
     # ------------------------------------------------------------------ helpers
 

@@ -35,7 +35,7 @@ class AgentRunService:
         run = AgentRun(
             run_id=_new_run_id(),
             channel=channel,
-            message_id=message_id,
+            message_id=message_id or None,  # NULL: exempt from the unique key
             conversation_id=conversation_id,
             sender_id=sender_id,
             sender_name=sender_name,

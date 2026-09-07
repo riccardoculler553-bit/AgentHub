@@ -62,6 +62,7 @@ def create_app() -> FastAPI:
         monitor = HeartbeatMonitor(app.state.hub)
         app.state.monitor_task = asyncio.create_task(monitor.run())
         task_monitor = TaskMonitor(app.state.hub)
+        task_monitor.recover_stuck_dispatching()  # V1.1 §42: restart recovery
         app.state.task_monitor_task = asyncio.create_task(task_monitor.run())
         # MVP: DingTalk -> Main Agent -> yingdao.audit (PDF §62-§64)
         app.state.mvp_agent = MvpAgentService(app.state.hub, sender=DingTalkSender())

@@ -80,30 +80,60 @@ class TaskMonitor:
             )
             expired = [svc.timeout_running(task) for task in live]
         for result in expired:
+            if not result.get("notify_device"):
+                continue  # lost the CAS: a result path closed the task already
             logger.warning("task %s TIMEOUT (watchdog)", result["task_id"])
-            task_row = await self._load(result["task_id"])
-            if task_row and task_row.target_device_id:
-                await self.hub.send_to_device(
-                    task_row.target_device_id,
-                    Envelope(
-                        id=new_message_id(),
-                        type=MessageType.TASK_CANCEL,
-                        data={"task_id": result["task_id"]},
-                    ),
-                )
+            await self._send_cancel(result["task_id"], result.get("attempt_id"), result.get("step_id"))
 
     async def notify_cancel(self, task_id: str) -> None:
-        """Best-effort task.cancel delivery for an admin-initiated cancel."""
-        task = await self._load(task_id)
-        if task and task.target_device_id:
-            await self.hub.send_to_device(
-                task.target_device_id,
-                Envelope(
-                    id=new_message_id(),
-                    type=MessageType.TASK_CANCEL,
-                    data={"task_id": task_id},
-                ),
-            )
+        """Best-effort task.cancel delivery for an admin-initiated cancel.
+        The envelope addresses the CURRENT attempt (V1.1 §16) so a cancel for
+        an old attempt can never kill a newer execution."""
+        with SessionLocal() as db:
+            attempt_id, step_id = TaskService(db)._current_attempt_ids(task_id)
+        await self._send_cancel(task_id, attempt_id, step_id)
+
+    async def _send_cancel(self, task_id: str, attempt_id: str | None, step_id: str | None) -> None:
+        task_row = await self._load(task_id)
+        if not task_row or not task_row.target_device_id:
+            return
+        data: dict = {"task_id": task_id}
+        if step_id:
+            data["step_id"] = step_id
+        if attempt_id:
+            data["attempt_id"] = attempt_id
+        await self.hub.send_to_device(
+            task_row.target_device_id,
+            Envelope(id=new_message_id(), type=MessageType.TASK_CANCEL, data=data),
+        )
+
+    def recover_stuck_dispatching(self) -> int:
+        """Server-restart recovery (V1.1 §42): tasks left in DISPATCHING by a
+        crash between CAS claim and send are parked back to PENDING with their
+        DISPATCHING attempt closed FAILED (SERVER_RESTART). DB-state based -
+        no blind re-dispatch; normal max_attempts accounting still applies."""
+        recovered = 0
+        with SessionLocal() as db:
+            svc = TaskService(db)
+            stuck = list(db.scalars(select(Task).where(Task.status == "DISPATCHING")))
+            for task in stuck:
+                for attempt in svc.get_attempts(task.task_id):
+                    if attempt.status == "DISPATCHING":
+                        attempt.status = "FAILED"
+                        attempt.finished_at = utcnow()
+                        attempt.error_code = "SERVER_RESTART"
+                        attempt.error_message = "dispatch interrupted by server restart"
+                for step in svc.get_steps(task.task_id):
+                    if step.status == "PENDING":
+                        step.current_attempt_id = None
+                task.status = "PENDING"
+                svc._record(task.task_id, "task.recovered", payload={"reason": "server_restart"})
+                recovered += 1
+            if recovered:
+                db.commit()
+        if recovered:
+            logger.warning("recovered %s task(s) stuck in DISPATCHING from a previous run", recovered)
+        return recovered
 
     async def _load(self, task_id: str):
         with SessionLocal() as db:
