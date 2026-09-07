@@ -2,13 +2,52 @@
 
 钉钉消息(模拟) -> MVP Agent -> Task(yingdao.audit) -> Worker -> 回复。
 Covers: success path with attempt_id, unknown device, offline device,
-busy device, unsupported intent.
+busy device, unsupported intent, busy jump-over routing.
 """
+
+import json
+import tempfile
+from pathlib import Path
 
 try:
     from agenthub._worker import FakeWorker, register_device, wait_for_capabilities, wait_until
 except ImportError:  # pragma: no cover - depends on pytest import mode
     from _worker import FakeWorker, register_device, wait_for_capabilities, wait_until
+
+
+def _install_route_config(devices: list[str]) -> None:
+    """Point the AgentTool registry at a custom business->device routing."""
+    from app.agent.mvp.tools import tool_registry
+    from app.core.config import settings
+
+    config_file = Path(tempfile.mkdtemp(prefix="route-")) / "agent_tools.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "name": "audit",
+                        "label": "审单",
+                        "command": "yingdao.audit",
+                        "keywords": ["审单"],
+                        "devices": devices,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    settings.agent_tools_config = str(config_file)
+    tool_registry.reload()
+
+
+def _restore_route_config() -> None:
+    from app.agent.mvp.tools import tool_registry
+    from app.core.config import settings
+
+    settings.agent_tools_config = None
+    tool_registry.reload()
 
 
 def _send_message(client, text: str) -> str:
@@ -116,3 +155,87 @@ def test_mvp_unsupported_intent(client):
     assert run["status"] == "FAILED"
     assert "审单" in run["final_reply"]
     assert run["task_id"] is None
+
+
+def test_mvp_routes_to_backup_device_when_first_busy(client):
+    """Busy jump-over (参考 dingtalk-xbot-audit busy handling + 多设备路由):
+    the first whitelist device is occupied -> the Agent routes the job to
+    the next configured device without asking."""
+    _install_route_config(["办公室电脑02", "仓库电脑01"])
+    try:
+        d1 = register_device(client, "办公室电脑02")
+        w1 = FakeWorker(client, d1["device_token"], capabilities=("yingdao.audit",), behaviour="silent")
+        w1.start()
+        d2 = register_device(client, "仓库电脑01")
+        w2 = FakeWorker(client, d2["device_token"], capabilities=("yingdao.audit",), max_dispatches=1)
+        w2.start()
+        try:
+            assert wait_for_capabilities(client, d1["device_id"], names=("yingdao.audit",))
+            assert wait_for_capabilities(client, d2["device_id"], names=("yingdao.audit",))
+
+            # occupy the first (preferred) device with an unacknowledged task
+            res = client.post(
+                "/api/tasks",
+                json={
+                    "name": "occupy",
+                    "target_device_id": d1["device_id"],
+                    "steps": [{"command": "yingdao.audit", "params": {}}],
+                },
+            )
+            assert res.status_code == 201, res.text
+            occupier = res.json()["task_id"]
+            assert wait_until(lambda: client.get(f"/api/tasks/{occupier}").json()["status"] == "SENT")
+
+            run_id = _send_message(client, "运行审单")
+            run = _await_run(client, run_id)
+            assert run["status"] == "SUCCESS", run
+            # ACK names the backup device that actually took the job
+            assert "仓库电脑01" in run["ack_reply"]
+            assert "已完成" in run["final_reply"]
+            detail = client.get(f"/api/tasks/{run['task_id']}").json()
+            assert detail["target_device_id"] == d2["device_id"]
+        finally:
+            w2.stop()
+            w1.stop()
+    finally:
+        _restore_route_config()
+
+
+def test_mvp_all_candidates_busy_replies_busy(client):
+    """Every whitelist device busy -> friendly busy reply, no task created."""
+    _install_route_config(["办公室电脑02", "仓库电脑01"])
+    try:
+        d1 = register_device(client, "办公室电脑02")
+        w1 = FakeWorker(client, d1["device_token"], capabilities=("yingdao.audit",), behaviour="silent")
+        w1.start()
+        d2 = register_device(client, "仓库电脑01")
+        w2 = FakeWorker(client, d2["device_token"], capabilities=("yingdao.audit",), behaviour="silent")
+        w2.start()
+        try:
+            assert wait_for_capabilities(client, d1["device_id"], names=("yingdao.audit",))
+            assert wait_for_capabilities(client, d2["device_id"], names=("yingdao.audit",))
+            for device in (d1, d2):
+                res = client.post(
+                    "/api/tasks",
+                    json={
+                        "name": "occupy",
+                        "target_device_id": device["device_id"],
+                        "steps": [{"command": "yingdao.audit", "params": {}}],
+                    },
+                )
+                assert res.status_code == 201, res.text
+                occupier = res.json()["task_id"]
+                assert wait_until(
+                    lambda occupier=occupier: client.get(f"/api/tasks/{occupier}").json()["status"] == "SENT"
+                )
+
+            run_id = _send_message(client, "运行审单")
+            run = _await_run(client, run_id)
+            assert run["status"] == "FAILED"
+            assert "稍后再试" in run["final_reply"]
+            assert run["task_id"] is None
+        finally:
+            w2.stop()
+            w1.stop()
+    finally:
+        _restore_route_config()

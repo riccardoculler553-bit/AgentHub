@@ -53,6 +53,15 @@ class AgentRunService:
             raise KeyError(run_id)
         return row
 
+    def get_by_message_id(self, message_id: str) -> AgentRun | None:
+        """Idempotency lookup (PDF 参考 dingtalk-xbot-audit MessageDeduplicator):
+        the same DingTalk msgId must create exactly one run."""
+        if not message_id:
+            return None
+        return self.db.scalars(
+            select(AgentRun).where(AgentRun.message_id == message_id).order_by(AgentRun.id.desc())
+        ).first()
+
     def list_runs(self, limit: int = 50) -> list[AgentRun]:
         return list(
             self.db.scalars(select(AgentRun).order_by(AgentRun.id.desc()).limit(max(1, min(limit, 200))))

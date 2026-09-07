@@ -19,7 +19,7 @@ from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 
 from app.agent.mvp.analyzer import analyze_with_llm
-from app.agent.mvp.schemas import COMMAND_LABELS
+from app.agent.mvp.tools import command_label, tool_registry
 from app.capability.service import CapabilityService
 from app.core.config import settings
 from app.db.database import SessionLocal
@@ -37,7 +37,7 @@ class MvpState(TypedDict, total=False):
     # request context
     text: str
     # analyze output
-    device_name: str  # name as understood from the message (or default)
+    device_name: str  # device mentioned in the message ("" = none)
     command: str
     # resolve output
     device_id: str | None
@@ -58,7 +58,7 @@ def _error(kind: str, message: str = "") -> dict:
 
 
 def _biz(command: str) -> str:
-    return COMMAND_LABELS.get(command, command)
+    return command_label(command)
 
 
 def build_mvp_graph(hub) -> "object":  # compiled StateGraph
@@ -74,45 +74,83 @@ def build_mvp_graph(hub) -> "object":  # compiled StateGraph
         intent = await analyze_with_llm(state["text"], device_names)
         if intent is None or intent.intent != "run_command":
             return {"error": _error("unsupported")}
-        device_name = intent.device_name.strip() or settings.agent_default_device_name
-        return {"device_name": device_name, "command": intent.command}
+        # No default injection: when nothing is mentioned the routing layer
+        # (whitelist / auto-discovery) decides which device runs the job.
+        return {"device_name": intent.device_name.strip(), "command": intent.command}
 
     async def resolve(state: MvpState) -> dict:
-        mentioned = state["device_name"]
-        command = state["command"]
-        with SessionLocal() as db:
-            device = db.scalars(
-                select(Device).where(Device.revoked_at.is_(None), Device.name.ilike(mentioned))
-            ).first()
-            if device is None:  # substring fallback for loose mentions
-                candidates = (
-                    db.execute(select(Device).where(Device.revoked_at.is_(None))).scalars().all()
-                )
-                device = next(
-                    (d for d in candidates if mentioned.lower() in d.name.lower()), None
-                )
-            if device is None:
-                return {"error": _error("device_not_found", mentioned)}
-            display_name = device.name
-            device_id = device.device_id
-            has_cap = CapabilityService(db).has_capability(device_id, command)
-            busy = db.scalars(
-                select(Task.task_id).where(
-                    Task.target_device_id == device_id,
-                    Task.status.in_(LIVE_TASK_STATES),
-                )
-            ).first()
+        """Device routing (the "which computer can run what" logic).
 
-        # Realtime presence comes from the hub, not the (possibly stale) DB.
-        online = hub.is_device_online(device_id)
-        if not online:
-            return {"error": _error("device_offline", display_name)}
-        if not has_cap:
-            return {"error": _error("capability_missing", display_name)}
-        if busy is not None:
-            return {"error": _error("device_busy", display_name)}
-        ack = f"收到，正在启动{display_name}的{_biz(command)}任务。"
-        return {"device_id": device_id, "display_name": display_name, "ack": ack}
+        Candidate order: device mentioned in the message -> configured
+        whitelist (tool.devices, priority order) -> auto-discovery of every
+        device reporting the capability (only when no whitelist). First
+        candidate that is registered + capable + online + not busy wins;
+        otherwise we keep scanning (busy jump-over), and the error is chosen
+        by priority: busy > offline > capability > not found.
+        """
+        mentioned = state["device_name"].strip()
+        command = state["command"]
+        tool = tool_registry.by_command(command)
+
+        with SessionLocal() as db:
+            devices = db.execute(
+                select(Device).where(Device.revoked_at.is_(None))
+            ).scalars().all()
+            by_name = {d.name.lower(): d for d in devices}
+            capability = CapabilityService(db)
+            busy_by_device = {
+                row[0]
+                for row in db.execute(
+                    select(Task.target_device_id).where(
+                        Task.status.in_(LIVE_TASK_STATES),
+                        Task.target_device_id.isnot(None),
+                    )
+                ).all()
+            }
+
+        candidates: list[str] = []
+        if mentioned:
+            candidates.append(mentioned)
+        if tool is not None:
+            candidates.extend(tool.devices)
+            if not tool.devices:
+                # no whitelist configured: auto-discover capable devices
+                candidates.extend(
+                    d.name for d in devices if capability.has_capability(d.device_id, command)
+                )
+        seen: set[str] = set()
+        ordered = [c for c in candidates if not (c.lower() in seen or seen.add(c.lower()))]
+
+        errors: dict[str, dict] = {}
+        priority = ("device_busy", "device_offline", "capability_missing")
+        for name in ordered:
+            device = by_name.get(name.lower())
+            if device is None:
+                continue
+            # offline wins over capability: a powered-off machine tells the
+            # user nothing about what it supports
+            if not hub.is_device_online(device.device_id):
+                errors.setdefault("device_offline", _error("device_offline", device.name))
+                continue
+            if not capability.has_capability(device.device_id, command):
+                errors.setdefault("capability_missing", _error("capability_missing", device.name))
+                continue
+            if device.device_id in busy_by_device:
+                errors.setdefault("device_busy", _error("device_busy", device.name))
+                continue
+            ack = f"收到，正在启动{device.name}的{_biz(command)}任务。"
+            return {
+                "device_id": device.device_id,
+                "display_name": device.name,
+                "ack": ack,
+            }
+
+        if errors:
+            for kind in priority:
+                if kind in errors:
+                    return {"error": errors[kind]}
+        mention = mentioned or (tool.devices[0] if tool is not None and tool.devices else "")
+        return {"error": _error("device_not_found", mention)}
 
     async def create_task(state: MvpState) -> dict:
         with SessionLocal() as db:
@@ -186,7 +224,8 @@ def build_mvp_graph(hub) -> "object":  # compiled StateGraph
         if error:
             kind = error.get("kind")
             if kind == "unsupported":
-                return {"reply": f"暂时只支持运行{_biz('yingdao.audit')}任务，例如：“运行办公室电脑02的审单”。"}
+                labels = "、".join(t.label for t in tool_registry.tools) or "审单"
+                return {"reply": f"暂时只支持{labels}任务，例如：“运行办公室电脑02的{tool_registry.tools[0].label}”。"}
             if kind == "device_not_found":
                 mention = error.get("message") or name
                 return {"reply": f"没有找到“{mention}”，请检查设备名称。"}
@@ -201,14 +240,21 @@ def build_mvp_graph(hub) -> "object":  # compiled StateGraph
             return {"reply": f"{name}的{biz}任务执行失败：{error.get('message', '未知错误')}"[:500]}
 
         status = state.get("task_status")
+        payload = (state.get("task_result") or {}).get("payload") or {}
+        nested = payload.get("error") or {}
+        err_code = str(payload.get("error_code") or nested.get("code") or "")
         if status == "SUCCESS":
             return {"reply": f"{name}的{biz}任务已完成。"}
         if status == "TIMEOUT":
             return {"reply": f"{name}的{biz}任务执行超时。"}
         if status == "CANCELLED":
             return {"reply": f"{name}的{biz}任务已取消。"}
-        payload = (state.get("task_result") or {}).get("payload") or {}
-        err_msg = str(payload.get("error_message") or "").strip()
+        if err_code == "EXECUTOR_BUSY":
+            # 影刀进程/日志显示该电脑正在跑别的任务 (参考 dingtalk-xbot-audit)
+            return {"reply": f"{name}当前正在运行其他程序，请稍后再试。"}
+        if err_code in ("EXECUTOR_LAUNCH_FAILED", "EXECUTOR_START_FAILED"):
+            return {"reply": f"{name}的{biz}任务启动失败，请检查该电脑上的影刀配置。"}
+        err_msg = str(payload.get("error_message") or nested.get("message") or "").strip()
         suffix = f"\n错误：{err_msg}" if err_msg else ""
         return {"reply": f"{name}的{biz}任务执行失败。{suffix}"[:500]}
 

@@ -1,36 +1,35 @@
 """AnalyzeRequest: user text -> ExecutionIntent (PDF §21-§24).
 
-Rules first (deterministic, offline-safe); LLM structured output only when an
-OpenAI-compatible key is configured. MVP commands are whitelisted in
-COMMAND_KEYWORDS - anything else becomes intent="unsupported".
+Rules first (deterministic, offline-safe): keyword match against the
+AgentTool registry decides which business command the user wants, and a
+device-name mention is extracted from the registered device list. LLM
+structured output is only used when an OpenAI-compatible key is configured,
+and its command is validated against the same registry - the model cannot
+invent a command.
 """
 
-import json
 import logging
 
 from app.agent.mvp.schemas import ExecutionIntent
+from app.agent.mvp.tools import tool_registry
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# command whitelist: keyword that triggers it inside the message
-COMMAND_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "yingdao.audit": ("审单",),
-}
 
-
-def _rule_intent(text: str) -> tuple[str | None, str]:
-    """(command, remaining device mention) matched by keywords."""
+def _match_command(text: str) -> str | None:
+    """Return the command whose keyword appears in the text (exact for
+    short keywords like 审单 - substring match would over-trigger)."""
     lowered = text.lower()
-    for command, keywords in COMMAND_KEYWORDS.items():
+    for command, keywords in tool_registry.all_keywords().items():
         for kw in keywords:
             if kw.lower() in lowered:
-                return command, text
-    return None, text
+                return command
+    return None
 
 
 def _extract_device_name(text: str, device_names: list[str]) -> str | None:
-    """Longest device name mentioned in the text (exact substring match)."""
+    """Longest registered device name mentioned in the text."""
     lowered = text.lower()
     best: str | None = None
     for name in device_names:
@@ -41,27 +40,28 @@ def _extract_device_name(text: str, device_names: list[str]) -> str | None:
 
 
 def analyze(text: str, device_names: list[str]) -> ExecutionIntent | None:
-    """Rule-based intent. Returns None when the command is not recognized."""
-    command, _ = _rule_intent(text)
+    """Rule-based intent. Returns None when no registered keyword matches."""
+    command = _match_command(text)
     if command is None:
         return None
     return ExecutionIntent(
         intent="run_command",
         device_name=_extract_device_name(text, device_names) or "",
-        command="yingdao.audit",  # narrow type for the schema
+        command=command,
     )
 
 
 async def analyze_with_llm(text: str, device_names: list[str]) -> ExecutionIntent | None:
-    """LLM structured output first (when configured), rules as fallback.
-
-    The prompt pins the command whitelist so the model cannot invent one.
-    """
+    """LLM structured output first (when configured), rules as fallback."""
     if settings.openai_api_key:
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
             from langchain_openai import ChatOpenAI
 
+            catalog = "\n".join(
+                f'- command "{t.command}" ({t.label}): trigger words {list(t.keywords)}'
+                for t in tool_registry.tools
+            )
             llm = ChatOpenAI(
                 model=settings.agenthub_model,
                 api_key=settings.openai_api_key,
@@ -71,22 +71,23 @@ async def analyze_with_llm(text: str, device_names: list[str]) -> ExecutionInten
             structured = llm.with_structured_output(ExecutionIntent)
             system = (
                 "You are the AgentHub MVP intent parser. Map the user request to "
-                'ExecutionIntent. command MUST be "yingdao.audit" when the user asks '
-                "to run an audit/审单 job; otherwise intent=\"unsupported\". "
-                "device_name must be copied verbatim from the user text when they "
-                "name a device, otherwise empty string."
+                "ExecutionIntent. Only these commands exist:\n"
+                f"{catalog}\n"
+                "If the request does not match any of them, set "
+                'intent="unsupported". device_name must be copied verbatim from '
+                "the user text when they name a device, otherwise empty string."
             )
             result = await structured.ainvoke(
                 [SystemMessage(content=system), HumanMessage(content=text)]
             )
             if isinstance(result, ExecutionIntent):
-                if result.intent == "run_command" and not result.device_name:
-                    result.device_name = _extract_device_name(text, device_names) or ""
+                if result.intent == "run_command":
+                    # validate against the registry; unknown command -> refuse
+                    if tool_registry.by_command(result.command) is None:
+                        return None
+                    if not result.device_name:
+                        result.device_name = _extract_device_name(text, device_names) or ""
                 return result
         except Exception:
             logger.exception("LLM intent analysis failed, falling back to rules")
     return analyze(text, device_names)
-
-
-def intent_to_json(intent: ExecutionIntent) -> str:
-    return json.dumps(intent.model_dump(), ensure_ascii=False)

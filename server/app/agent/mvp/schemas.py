@@ -1,8 +1,8 @@
 """MVP agent schemas (PDF §19/§23/§59).
 
-Deliberately tiny: one intent, one command whitelist entry, one device name.
-The LLM (when configured) can only ever produce these shapes - it can never
-invent a shell command or pick an arbitrary device id.
+Deliberately tiny: the LLM (when configured) can only ever produce these
+shapes, and the command is validated against the AgentTool registry - it can
+never invent a shell command or pick an arbitrary device id.
 """
 
 from datetime import datetime
@@ -16,13 +16,7 @@ class ExecutionIntent(BaseModel):
 
     intent: Literal["run_command", "unsupported"] = "run_command"
     device_name: str = Field(default="", max_length=100)
-    command: Literal["yingdao.audit"] = "yingdao.audit"
-
-
-# command -> business name used in user-facing replies
-COMMAND_LABELS: dict[str, str] = {
-    "yingdao.audit": "审单",
-}
+    command: str = Field(default="yingdao.audit", max_length=128)
 
 
 # ---------------------------------------------------------------- MVP API

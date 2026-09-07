@@ -7,8 +7,17 @@
       "version": "1.0",
       "executor_type": "yingdao",
       "robot_uuid": "PASTE_YOUR_ROBOT_UUID_HERE",
-      "shadowbot_path": "C:\\Program Files (x86)\\ShadowBot\\shadowbot.exe",
-      "args": ["shadowbot:Run?robot-uuid={robot_uuid}"]
+      "shadowbot_path": "C:\\Program Files (x86)\\ShadowBot\\ShadowBot.exe",
+      "args": ["shadowbot:Run?robot-uuid={robot_uuid}"],
+      "wait_for_exit": true,
+      "check_mode": "log",
+      "log_dir": "%LOCALAPPDATA%/ShadowBot/log",
+      "process_names": [],
+      "settle_after_end_seconds": 3,
+      "launch_verify_seconds": 4,
+      "launch_max_retries": 2,
+      "close_success_box": true,
+      "success_box_keywords": ["运行成功", "执行成功"]
     }
   ]
 }

@@ -71,10 +71,14 @@ class Settings:
         self.agent_run_max_wait = int(os.getenv("AGENT_RUN_MAX_WAIT", "1900"))
         # Device assumed when the message names none (MVP: fixed target).
         self.agent_default_device_name = os.getenv("AGENT_DEFAULT_DEVICE_NAME", "办公室电脑02")
+        # 业务->命令->设备路由表 JSON; empty = built-in defaults
+        self.agent_tools_config = os.getenv("AGENT_TOOLS_CONFIG", "") or None
         # DingTalk robot (Stream Mode). Empty disables the integration.
         self.dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID", "") or None
         self.dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET", "") or None
         self.dingtalk_robot_code = os.getenv("DINGTALK_ROBOT_CODE", "") or None
+        # Per-group throttle; <=0 disables (dingtalk channel only)
+        self.dingtalk_throttle_seconds = int(os.getenv("DINGTALK_THROTTLE_SECONDS", "30"))
 
 
 settings = Settings()

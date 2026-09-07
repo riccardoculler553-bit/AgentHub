@@ -1,0 +1,11 @@
+{
+  "tools": [
+    {
+      "name": "audit",
+      "label": "审单",
+      "command": "yingdao.audit",
+      "keywords": ["审单"],
+      "devices": ["办公室电脑02"]
+    }
+  ]
+}

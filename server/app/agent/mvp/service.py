@@ -40,12 +40,18 @@ class MvpAgentService:
         sender_name: str | None = None,
         reply_webhook: str | None = None,
     ) -> str:
-        """Persist the AgentRun and kick off background processing. Returns
-        the run_id immediately (never blocks on the graph)."""
+        """Persist the AgentRun and kick off background processing. Returns the run_id immediately (never blocks on the graph). The same
+        message_id returns the run already created for it (DingTalk retries,
+        Stream reconnect replays) instead of running the job twice."""
         from app.db.database import SessionLocal
 
         with SessionLocal() as db:
-            run = AgentRunService(db).create(
+            service = AgentRunService(db)
+            if message_id:
+                existing = service.get_by_message_id(message_id)
+                if existing is not None:
+                    return existing.run_id
+            run = service.create(
                 channel=channel,
                 message_id=message_id,
                 conversation_id=conversation_id,
