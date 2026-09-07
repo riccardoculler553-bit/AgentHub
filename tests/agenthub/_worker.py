@@ -107,19 +107,20 @@ class FakeWorker:
 
     def _answer(self, session, data: dict) -> None:
         task_id, step_id = data["task_id"], data["step_id"]
+        attempt_id = data.get("attempt_id", "")
 
         def send(msg_id: str, msg_type: str, payload: dict) -> None:
             session.send_json({"id": msg_id, "type": msg_type, "version": 1, "timestamp": 1, "data": payload})
             self.received.append(session.receive_json())  # message_ack
 
-        send("a", "task.accept", {"task_id": task_id, "step_id": step_id})
-        send("r", "task.running", {"task_id": task_id, "step_id": step_id})
+        send("a", "task.accept", {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id})
+        send("r", "task.running", {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id})
         if self.behaviour == "fail":
             send(
                 "x",
                 "task.result",
                 {
-                    "task_id": task_id, "step_id": step_id, "status": "failed",
+                    "task_id": task_id, "step_id": step_id, "attempt_id": attempt_id, "status": "failed",
                     "error": {"code": "EXECUTOR_FAILED", "message": "boom"},
                 },
             )
@@ -128,7 +129,7 @@ class FakeWorker:
                 "x",
                 "task.result",
                 {
-                    "task_id": task_id, "step_id": step_id, "status": "success",
+                    "task_id": task_id, "step_id": step_id, "attempt_id": attempt_id, "status": "success",
                     "result": {"echo": data.get("params", {}).get("message")},
                 },
             )

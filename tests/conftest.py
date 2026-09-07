@@ -16,8 +16,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # (StaticPool) corrupts transaction state under this concurrency.
 _TMP_DB = Path(tempfile.mkdtemp(prefix="devicelink-test-")) / "test.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{_TMP_DB.as_posix()}"
-# Keep client identity writes inside the test tree
-os.environ.setdefault("DEVICELINK_HOME", str(PROJECT_ROOT / ".pytest_client"))
+# Fresh client identity/ledger home per session (worker.db accumulates state)
+os.environ["DEVICELINK_HOME"] = str(Path(tempfile.mkdtemp(prefix="devicelink-client-")))
+# Keep MVP agent runs short if a result never arrives.
+os.environ["AGENT_RUN_MAX_WAIT"] = "20"
 # Tests exercise the open mode; admin auth is covered separately.
 os.environ.pop("AGENTHUB_ADMIN_TOKEN", None)
 # Do not let a developer .env steer the agent into real LLM calls during tests.

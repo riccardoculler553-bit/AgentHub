@@ -39,6 +39,9 @@ class DeviceClient:
         self.identities = IdentityManager()
         self.identity: DeviceIdentity | None = None
         self.reconnector = ReconnectManager()
+        self.task_manager = TaskManager()
+        self._capabilities = reportable_capabilities()
+        self._caps_reported = False
         self._stop = asyncio.Event()
 
     def register(self, code: str | None = None) -> DeviceIdentity:

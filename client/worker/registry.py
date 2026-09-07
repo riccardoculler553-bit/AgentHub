@@ -16,11 +16,13 @@ from pathlib import Path
 
 from worker.executors.echo import EchoExecutor
 from worker.executors.python_executor import PythonExecutor
+from worker.executors.yingdao import YingdaoExecutor
 
 # executor_type (declared locally) -> executor implementation
 EXECUTOR_TYPES = {
     "echo": EchoExecutor,
     "python": PythonExecutor,
+    "yingdao": YingdaoExecutor,
 }
 
 CAPABILITIES_FILE = Path(__file__).resolve().parent / "capabilities.json"
@@ -35,13 +37,17 @@ def load_capability_config() -> list[dict]:
 
 
 def build_command_registry() -> dict:
-    """{command_name: executor_instance} - the Worker Executor Registry."""
+    """{command_name: executor_instance} - the Worker Executor Registry.
+    Each instance receives its capabilities.json config block (robot_uuid,
+    shadowbot_path, ...)."""
     registry: dict = {}
     for item in load_capability_config():
         executor_type = item.get("executor_type")
         name = str(item.get("name", "")).strip()
         if name and executor_type in EXECUTOR_TYPES and name not in registry:
-            registry[name] = EXECUTOR_TYPES[executor_type]()
+            executor = EXECUTOR_TYPES[executor_type]()
+            executor.configure(item)
+            registry[name] = executor
     return registry
 
 

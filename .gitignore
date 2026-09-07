@@ -13,3 +13,5 @@ client_data/
 .trae/
 client.zip
 .pt*.txt
+.pytest_client/
+worker.db

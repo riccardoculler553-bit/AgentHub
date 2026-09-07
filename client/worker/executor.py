@@ -25,6 +25,9 @@ class ExecutionError(Exception):
 class Executor:
     name = "base"
 
+    def configure(self, config: dict) -> None:
+        """Receive the per-capability config block from capabilities.json."""
+
     def validate(self, params: dict) -> None:
         """Raise ValueError on invalid params."""
 

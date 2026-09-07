@@ -20,6 +20,7 @@ from app.device.service import DeviceService
 from app.task.db_models import Task, TaskAttempt, TaskEvent, TaskStep
 from app.task.errors import InvalidTaskState, TaskNotFound, TaskValidationFailed
 from app.task.models import TaskCreateIn
+from app.task.waiters import task_waiters
 
 TERMINAL_TASK_STATES = {"SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"}
 # Task statuses that mean "a dispatch may be flying / worker may still be alive"
@@ -175,6 +176,7 @@ class TaskService:
         should be dispatched (the caller triggers the Dispatcher)."""
         task_id = str(data.get("task_id", ""))
         step_id = str(data.get("step_id", ""))
+        attempt_id = str(data.get("attempt_id", "")) or None
         task = self.get(task_id)
         step = self.db.scalars(
             select(TaskStep).where(TaskStep.step_id == step_id, TaskStep.task_id == task_id)
@@ -182,7 +184,16 @@ class TaskService:
         if step is None:
             raise TaskNotFound(task_id)
 
-        attempt = self.latest_open_attempt(task_id, step_id)
+        attempt = None
+        if attempt_id:
+            # Prefer exact attempt matching (idempotency + late results).
+            attempt = self.db.scalars(
+                select(TaskAttempt).where(
+                    TaskAttempt.attempt_id == attempt_id, TaskAttempt.task_id == task_id
+                )
+            ).first()
+        if attempt is None:
+            attempt = self.latest_open_attempt(task_id, step_id)
         if attempt is not None and attempt.device_id not in (None, device_id):
             # A device may only report its own attempts (security boundary).
             return {"task_id": task_id, "advance": False}
@@ -267,6 +278,9 @@ class TaskService:
             return {"task_id": task_id, "advance": False}
 
         self.db.commit()
+        if msg_type == "task.result" and task.status in TERMINAL_TASK_STATES:
+            # Wake in-process waiters (MVP agent) - DB polling stays as fallback.
+            task_waiters.notify(task_id)
         return {"task_id": task_id, "advance": advance}
 
     # ------------------------------------------------------- admin-side actions

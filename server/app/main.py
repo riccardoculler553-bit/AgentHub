@@ -12,13 +12,17 @@ from app.api import devices, registration
 from app.api import websocket as ws_api
 from app.api import tasks as tasks_api
 from app.api import agent as agent_api
+from app.command.db_models import Command  # noqa: F401 - AgentHub tables
+from app.agent.db_models import AgentRun  # noqa: F401 - MVP agent_runs table
+from app.command.service import CommandService
+from app.integrations.dingtalk.client import start_dingtalk_bot
+from app.integrations.dingtalk.sender import DingTalkSender
+from app.agent.mvp.service import MvpAgentService
 from app.core.config import settings
 from app.db.database import Base, SessionLocal, engine
 from app.db.models import User  # noqa: F401 - ensure models are registered
-from app.command.db_models import Command  # noqa: F401 - AgentHub tables
 from app.capability.db_models import DeviceCapability  # noqa: F401
 from app.task.db_models import Task, TaskAttempt, TaskEvent, TaskStep  # noqa: F401
-from app.command.service import CommandService
 from app.task.monitor import TaskMonitor
 from app.websocket.heartbeat import HeartbeatMonitor
 from app.websocket.hub import ConnectionHub
@@ -52,9 +56,16 @@ def create_app() -> FastAPI:
         app.state.monitor_task = asyncio.create_task(monitor.run())
         task_monitor = TaskMonitor(app.state.hub)
         app.state.task_monitor_task = asyncio.create_task(task_monitor.run())
+        # MVP: DingTalk -> Main Agent -> yingdao.audit (PDF §62-§64)
+        app.state.mvp_agent = MvpAgentService(app.state.hub, sender=DingTalkSender())
+        app.state.dingtalk_task = await start_dingtalk_bot(app.state.hub, app.state.mvp_agent)
         logger.info("%s started on %s:%s", settings.app_name, settings.host, settings.port)
         yield
-        for task in (app.state.monitor_task, app.state.task_monitor_task):
+        background = [app.state.monitor_task, app.state.task_monitor_task]
+        dingtalk_task = getattr(app.state, "dingtalk_task", None)
+        if dingtalk_task is not None:
+            background.append(dingtalk_task)
+        for task in background:
             task.cancel()
             try:
                 await task

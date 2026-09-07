@@ -65,6 +65,16 @@ class Settings:
         # Main Agent run loop
         self.agent_poll_interval = int(os.getenv("AGENT_POLL_INTERVAL", "2"))
         self.agent_max_wait = int(os.getenv("AGENT_MAX_WAIT", "300"))
+        # --- MVP (DingTalk -> Agent -> yingdao.audit) ---
+        # Background agent run waits at most this long for the task result
+        # (yingdao.audit timeout is 1800s, so leave headroom).
+        self.agent_run_max_wait = int(os.getenv("AGENT_RUN_MAX_WAIT", "1900"))
+        # Device assumed when the message names none (MVP: fixed target).
+        self.agent_default_device_name = os.getenv("AGENT_DEFAULT_DEVICE_NAME", "办公室电脑02")
+        # DingTalk robot (Stream Mode). Empty disables the integration.
+        self.dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID", "") or None
+        self.dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET", "") or None
+        self.dingtalk_robot_code = os.getenv("DINGTALK_ROBOT_CODE", "") or None
 
 
 settings = Settings()

@@ -77,6 +77,15 @@ SEED_COMMANDS = [
         "params_schema": {},
         "timeout": 120,
     },
+    {
+        "command_name": "yingdao.audit",
+        "version": "1.0",
+        "description": "执行影刀审单机器人（MVP 真实业务）",
+        "executor_type": "yingdao",
+        "executor_config": {},
+        "params_schema": {},
+        "timeout": 1800,
+    },
 ]
 
 

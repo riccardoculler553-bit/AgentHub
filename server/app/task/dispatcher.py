@@ -16,7 +16,7 @@ from app.db.database import SessionLocal
 from app.db.models import utcnow
 from app.task.db_models import Task, TaskAttempt, TaskStep
 from app.task.device_link import DeviceLinkService
-from app.task.service import TaskService
+from app.task.service import LIVE_TASK_STATES, TaskService
 from app.websocket.protocol import Envelope, MessageType, new_message_id
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,26 @@ class TaskDispatcher:
 
             if not self.device_link.is_online(device_id):
                 return False  # stay PENDING; the monitor retries while within max wait
+
+            # Device lock (PDF §81): only one live task per device. The MVP
+            # agent checks this before creating the task; this is the race
+            # backstop. DEVICE_BUSY fails the task instead of queueing (§80).
+            busy = db.scalars(
+                select(Task.task_id).where(
+                    Task.target_device_id == device_id,
+                    Task.status.in_(LIVE_TASK_STATES),
+                    Task.task_id != task_id,
+                )
+            ).first()
+            if busy is not None:
+                task.status = "FAILED"
+                task.finished_at = utcnow()
+                service._record(
+                    task_id, "task.failed", step_id=step.step_id,
+                    payload={"error_code": "DEVICE_BUSY", "error_message": f"device busy with task {busy}"},
+                )
+                db.commit()
+                return False
 
             if not CapabilityService(db).has_capability(device_id, step.command):
                 task.status = "FAILED"
@@ -76,6 +96,7 @@ class TaskDispatcher:
                 data={
                     "task_id": task_id,
                     "step_id": step.step_id,
+                    "attempt_id": attempt.attempt_id,
                     "command": step.command,
                     "params": step.params,
                     "timeout": int(command.timeout),

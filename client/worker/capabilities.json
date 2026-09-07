@@ -1,6 +1,14 @@
 {
   "capabilities": [
     { "name": "echo", "version": "1.0", "executor_type": "echo" },
-    { "name": "python.demo", "version": "1.0", "executor_type": "python" }
+    { "name": "python.demo", "version": "1.0", "executor_type": "python" },
+    {
+      "name": "yingdao.audit",
+      "version": "1.0",
+      "executor_type": "yingdao",
+      "robot_uuid": "PASTE_YOUR_ROBOT_UUID_HERE",
+      "shadowbot_path": "C:\\Program Files (x86)\\ShadowBot\\shadowbot.exe",
+      "args": ["shadowbot:Run?robot-uuid={robot_uuid}"]
+    }
   ]
 }

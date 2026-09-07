@@ -1,0 +1,61 @@
+"""MVP agent schemas (PDF §19/§23/§59).
+
+Deliberately tiny: one intent, one command whitelist entry, one device name.
+The LLM (when configured) can only ever produce these shapes - it can never
+invent a shell command or pick an arbitrary device id.
+"""
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class ExecutionIntent(BaseModel):
+    """Structured output of AnalyzeRequest (PDF §21/§23)."""
+
+    intent: Literal["run_command", "unsupported"] = "run_command"
+    device_name: str = Field(default="", max_length=100)
+    command: Literal["yingdao.audit"] = "yingdao.audit"
+
+
+# command -> business name used in user-facing replies
+COMMAND_LABELS: dict[str, str] = {
+    "yingdao.audit": "审单",
+}
+
+
+# ---------------------------------------------------------------- MVP API
+
+
+class AgentMessageIn(BaseModel):
+    """Simulated / relayed user request (PDF §94)."""
+
+    text: str = Field(min_length=1, max_length=2000)
+    channel: str = Field(default="api", max_length=32)
+    message_id: str = Field(default="", max_length=128)
+    conversation_id: str = Field(default="", max_length=128)
+    sender_id: str = Field(default="", max_length=128)
+    sender_name: str | None = Field(default=None, max_length=128)
+
+
+class AgentMessageOut(BaseModel):
+    run_id: str
+    status: str = "RUNNING"
+
+
+class AgentRunRecordOut(BaseModel):
+    run_id: str
+    channel: str
+    conversation_id: str
+    sender_id: str
+    sender_name: str | None = None
+    message_id: str
+    input_text: str
+    status: str
+    task_id: str | None = None
+    ack_reply: str
+    final_reply: str | None = None
+    error: str | None = None
+    created_at: datetime
+    finished_at: datetime | None = None

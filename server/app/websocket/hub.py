@@ -53,6 +53,31 @@ class ConnectionHub:
         with self._lock:
             return len(self._device_connections.get(device_id, set()))
 
+    def select_worker_connection(self, device_id: str) -> DeviceConnection | None:
+        """Pick exactly ONE live connection as this device's task executor.
+
+        task.dispatch must never be broadcast: a device with several live
+        connections would run the RPA twice (PDF §78). Deterministic pick for
+        stability across quick successive dispatches."""
+        connections = self.get_device_connections(device_id)
+        if not connections:
+            return None
+        return sorted(connections, key=lambda c: c.connection_id)[0]
+
+    async def send_to_worker(self, device_id: str, envelope: Envelope) -> int:
+        """Single-connection task delivery. Returns 1 when delivered, 0 when
+        the device has no live connection (or the picked one just died)."""
+        connection = self.select_worker_connection(device_id)
+        if connection is None:
+            return 0
+        try:
+            await connection.send(envelope)
+            return 1
+        except Exception:
+            logger.warning("send to worker connection %s failed, pruning", connection.connection_id)
+            await self.unregister(connection)
+            return 0
+
     async def send_to_device(self, device_id: str, envelope: Envelope) -> int:
         """Send to every live connection of the device. Returns number of successful sends."""
         sent = 0

@@ -14,8 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-timeout>=2"]
 agent = ["langgraph>=0.2", "langchain-core>=0.3", "langchain-openai>=0.2"]
+dingtalk = ["dingtalk-stream>=0.24"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

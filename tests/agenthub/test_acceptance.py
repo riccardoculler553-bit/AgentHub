@@ -1,6 +1,7 @@
 """AgentHub V1.0 acceptance: isolation, offline redispatch, idempotency, attempts."""
 
 import asyncio
+from pathlib import Path
 
 try:
     from agenthub._worker import FakeWorker, register_device, wait_for_capabilities, wait_until
@@ -79,7 +80,7 @@ def test_offline_device_pends_then_redispatches_on_connect(client):
             live_worker.stop()
 
 
-def test_worker_dedups_duplicate_dispatch():
+def test_worker_dedups_duplicate_dispatch(tmp_path):
     """Client-side idempotency: a repeated task.dispatch is reported, not re-run."""
 
     class RecordingClient:
@@ -89,8 +90,10 @@ def test_worker_dedups_duplicate_dispatch():
         async def send(self, envelope: dict) -> None:
             self.sent.append(envelope)
 
-    async def scenario() -> tuple[list[dict], int]:
-        manager = TaskManager()
+    async def scenario(tmp: str) -> tuple[list[dict], int]:
+        from worker.ledger import ExecutionLedger
+
+        manager = TaskManager(ledger=ExecutionLedger(Path(tmp) / "worker.db"))
         ws = RecordingClient()
         manager.bind(ws)
         envelope = {
@@ -99,15 +102,20 @@ def test_worker_dedups_duplicate_dispatch():
                      "params": {"message": "hi"}, "timeout": 30},
         }
         await manager.on_dispatch(dict(envelope))
-        await manager.on_dispatch(dict(envelope))  # duplicate
-        return ws.sent, manager._queue.qsize()
+        queued = manager._queue.qsize()  # exactly one execution queued
+        await manager._queue.join()  # execution #1 fully done
+        accepted = len([e for e in ws.sent if e["type"] == "task.accept"])
+        await manager.on_dispatch(dict(envelope))  # duplicate: re-report, no re-run
+        await manager._queue.join()
+        return ws.sent, queued, accepted
 
-    sent, queued = asyncio.run(scenario())
+    sent, queued, accepted = asyncio.run(scenario(str(tmp_path)))
     types = [e["type"] for e in sent]
-    # second dispatch must NOT queue a second execution; it only reports state
+    # second dispatch must NOT queue a second execution; it only re-reports
     assert queued == 1
+    assert accepted == 1
     assert types.count("task.accept") == 1
-    assert types[-1] == "task.running"  # dedup path reports current state
+    assert types[-1] == "task.result"  # duplicate path reports the stored result
 
 
 def test_retry_attempts_bookkeeping(client):
