@@ -73,12 +73,33 @@ class Settings:
         self.agent_default_device_name = os.getenv("AGENT_DEFAULT_DEVICE_NAME", "办公室电脑02")
         # 业务->命令->设备路由表 JSON; empty = built-in defaults
         self.agent_tools_config = os.getenv("AGENT_TOOLS_CONFIG", "") or None
+        # --- V1.2 Tool-Using Agent ---
+        # mvp = fixed-pipeline MVP agent handles DingTalk messages;
+        # tool_agent = V1.2 LangGraph tool-using agent (PDF §97).
+        self.agent_mode = os.getenv("AGENT_MODE", "mvp")
+        # Per-run tool call budget (PDF §41: max_tool_calls = 8)
+        self.agent_max_tool_calls = int(os.getenv("AGENT_MAX_TOOL_CALLS", "8"))
+        # Transient LLM failures get limited retries (PDF §127)
+        self.agent_max_llm_retries = int(os.getenv("AGENT_MAX_LLM_RETRIES", "2"))
+        # execute_command/retry_task wait at most this long for a terminal
+        # task state inside the tool call; past that the tool reports
+        # status=RUNNING and the LLM answers accordingly (PDF §45).
+        self.agent_tool_wait_max = int(os.getenv("AGENT_TOOL_WAIT_MAX", "1900"))
+        # Require user confirmation before ACTION tools (execute_command).
+        # WRITE tools (retry/cancel) always confirm (PDF §56-§57).
+        self.agent_confirm_actions = os.getenv("AGENT_CONFIRM_ACTIONS", "false").lower() in ("1", "true", "yes")
+        # Reasoning-loop wall-clock guard (PDF §42): when exceeded the agent
+        # finishes with whatever it has instead of looping further.
+        self.agent_max_runtime = int(os.getenv("AGENT_MAX_RUNTIME", "120"))
         # DingTalk robot (Stream Mode). Empty disables the integration.
         self.dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID", "") or None
         self.dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET", "") or None
         self.dingtalk_robot_code = os.getenv("DINGTALK_ROBOT_CODE", "") or None
         # Per-group throttle; <=0 disables (dingtalk channel only)
         self.dingtalk_throttle_seconds = int(os.getenv("DINGTALK_THROTTLE_SECONDS", "30"))
+        # --- V1.3 Workflow Engine ---
+        # Safety-net sweep interval (task-terminal observer does real-time work)
+        self.workflow_monitor_interval = float(os.getenv("WORKFLOW_MONITOR_INTERVAL", "5"))
 
 
 settings = Settings()

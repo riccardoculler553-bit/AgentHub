@@ -12,6 +12,7 @@ from app.api import devices, registration
 from app.api import websocket as ws_api
 from app.api import tasks as tasks_api
 from app.api import agent as agent_api
+from app.api import workflows as workflows_api
 from app.command.db_models import Command  # noqa: F401 - AgentHub tables
 from app.agent.db_models import AgentRun  # noqa: F401 - MVP agent_runs table
 from app.command.service import CommandService
@@ -23,9 +24,20 @@ from app.db.database import Base, SessionLocal, engine
 from app.db.models import User  # noqa: F401 - ensure models are registered
 from app.capability.db_models import DeviceCapability  # noqa: F401
 from app.task.db_models import Task, TaskAttempt, TaskEvent, TaskStep  # noqa: F401
+from app.task.events import subscribe_task_terminal
 from app.task.monitor import TaskMonitor
 from app.websocket.heartbeat import HeartbeatMonitor
 from app.websocket.hub import ConnectionHub
+from app.workflow.db_models import (  # noqa: F401 - V1.3 workflow tables
+    Workflow,
+    WorkflowEvent,
+    WorkflowRun,
+    WorkflowStep,
+    WorkflowStepRun,
+    ensure_task_source_columns,
+)
+from app.workflow.monitor import WorkflowMonitor
+from app.workflow.runtime import workflow_runtime
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -64,12 +76,30 @@ def create_app() -> FastAPI:
         task_monitor = TaskMonitor(app.state.hub)
         task_monitor.recover_stuck_dispatching()  # V1.1 §42: restart recovery
         app.state.task_monitor_task = asyncio.create_task(task_monitor.run())
-        # MVP: DingTalk -> Main Agent -> yingdao.audit (PDF §62-§64)
-        app.state.mvp_agent = MvpAgentService(app.state.hub, sender=DingTalkSender())
-        app.state.dingtalk_task = await start_dingtalk_bot(app.state.hub, app.state.mvp_agent)
+        # V1.3 §54/§121: workflow recovery + task-terminal advancement wiring.
+        ensure_task_source_columns(engine)
+        workflow_monitor = WorkflowMonitor(app.state.hub)
+        workflow_monitor.recover_from_restart()
+        app.state.workflow_monitor_task = asyncio.create_task(workflow_monitor.run())
+        workflow_runtime.bind(app.state.hub, asyncio.get_running_loop())
+        subscribe_task_terminal(workflow_runtime.on_task_terminal)
+        # V1.2 §97: AGENT_MODE switches the message-facing agent. Both expose
+        # the same handle_message intake the DingTalk client calls.
+        if settings.agent_mode == "tool_agent":
+            from app.agent.service import AgentService
+
+            app.state.agent_service = AgentService(app.state.hub, sender=DingTalkSender())
+            logger.info("agent mode: tool_agent (V1.2 LangGraph tool-using agent)")
+        else:
+            app.state.agent_service = MvpAgentService(app.state.hub, sender=DingTalkSender())
+            logger.info("agent mode: mvp")
+        app.state.dingtalk_task = await start_dingtalk_bot(app.state.hub, app.state.agent_service)
         logger.info("%s started on %s:%s", settings.app_name, settings.host, settings.port)
         yield
         background = [app.state.monitor_task, app.state.task_monitor_task]
+        workflow_monitor_task = getattr(app.state, "workflow_monitor_task", None)
+        if workflow_monitor_task is not None:
+            background.append(workflow_monitor_task)
         dingtalk_task = getattr(app.state, "dingtalk_task", None)
         if dingtalk_task is not None:
             background.append(dingtalk_task)
@@ -89,6 +119,7 @@ def create_app() -> FastAPI:
     app.include_router(ws_api.router)
     app.include_router(tasks_api.router)
     app.include_router(agent_api.router)
+    app.include_router(workflows_api.router)
 
     @app.get("/", include_in_schema=False)
     async def dashboard():

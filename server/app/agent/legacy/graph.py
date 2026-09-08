@@ -16,9 +16,9 @@ import time
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
 
-from app.agent import tools
-from app.agent.planner import PlanError, build_plan
-from app.agent.state import AgentState
+from app.agent.legacy import tools
+from app.agent.legacy.planner import PlanError, build_plan
+from app.agent.legacy.state import AgentState
 from app.core.config import settings
 from app.db.database import SessionLocal
 from app.task import models as schemas

@@ -38,6 +38,12 @@ class AgentMessageOut(BaseModel):
     status: str = "RUNNING"
 
 
+class ResumeMessageIn(BaseModel):
+    """User follow-up that resumes a WAITING_USER run (PDF §91/§133)."""
+
+    text: str = Field(min_length=1, max_length=2000)
+
+
 class AgentRunRecordOut(BaseModel):
     run_id: str
     channel: str
@@ -52,5 +58,6 @@ class AgentRunRecordOut(BaseModel):
     ack_reply: str
     final_reply: str | None = None
     error: str | None = None
+    tool_call_count: int = 0  # V1.2 §125: kept on the run for audit
     created_at: datetime
     finished_at: datetime | None = None

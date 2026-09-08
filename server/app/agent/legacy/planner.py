@@ -130,7 +130,7 @@ def _validate_plan(db, plan: dict) -> dict:
 
 
 def _commands(db: Session) -> list[dict]:
-    from app.agent.tools import list_commands
+    from app.agent.legacy.tools import list_commands
 
     return list_commands(db)
 

@@ -19,6 +19,7 @@ from app.db.models import utcnow
 from app.device.service import DeviceService
 from app.task.db_models import Task, TaskAttempt, TaskEvent, TaskStep
 from app.task.errors import InvalidTaskState, TaskNotFound, TaskValidationFailed
+from app.task.events import notify_task_terminal
 from app.task.models import TaskCreateIn
 from app.task.state import ATTEMPT_TERMINAL_STATES, TASK_TERMINAL_STATES, can_transition
 from app.task.waiters import task_waiters
@@ -90,6 +91,11 @@ class TaskService:
             target_device_id=device.device_id,
             status="PENDING",
             max_attempts=settings.task_max_attempts,
+            # V1.3 provenance (§32/§33): AGENT tools / WORKFLOW engine mark it;
+            # API stays the default.
+            source_type=payload.source_type or ("AGENT" if created_by == "tool_agent" else "API"),
+            workflow_run_id=payload.workflow_run_id,
+            workflow_step_run_id=payload.workflow_step_run_id,
         )
         self.db.add(task)
         for index, step in enumerate(payload.steps, start=1):
@@ -327,6 +333,8 @@ class TaskService:
         if msg_type == "task.result" and task.status in TERMINAL_TASK_STATES:
             # Wake in-process waiters (MVP agent) - DB polling stays as fallback.
             task_waiters.notify(task_id)
+            # V1.3 §121: workflow advancement hooks the same terminal fact.
+            notify_task_terminal(task_id)
         return {"task_id": task_id, "advance": advance}
 
     def _apply_attempt_result(self, attempt: TaskAttempt | None, data: dict, now) -> bool:
@@ -431,6 +439,8 @@ class TaskService:
                 payload={"reason": "timeout_at elapsed"},
             )
         self.db.commit()
+        if updated_task:
+            notify_task_terminal(task.task_id)  # V1.3 §121: TIMEOUT is terminal
         return {
             "task_id": task.task_id,
             "status": "TIMEOUT" if updated_task else task.status,

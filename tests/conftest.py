@@ -90,6 +90,13 @@ def setup_db():
     engine.dispose()
 
 
+@pytest.fixture
+def anyio_backend():
+    """Async unit tests (tool/policy/graph) run on asyncio via the anyio
+    plugin shipped with starlette's dependency tree - no extra plugin needed."""
+    return "asyncio"
+
+
 @pytest.fixture()
 def client():
     with TestClient(fastapi_app) as test_client:

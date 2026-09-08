@@ -24,6 +24,11 @@ class Task(Base):
     target_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     # PENDING/DISPATCHING/SENT/ACCEPTED/RUNNING/SUCCESS/FAILED/TIMEOUT/CANCELLED
     status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    # V1.3: where this task came from (API/AGENT/WORKFLOW/MANUAL, §32/§154)
+    source_type: Mapped[str | None] = mapped_column(String(32), nullable=True, default="API")
+    # V1.3 audit trail: reverse lookup Task -> WorkflowStepRun -> WorkflowRun (§31/§155)
+    workflow_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    workflow_step_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

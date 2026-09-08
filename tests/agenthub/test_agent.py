@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from app.agent.planner import PlanError, build_plan
+from app.agent.legacy.planner import PlanError, build_plan
 from app.core.config import settings
 
 

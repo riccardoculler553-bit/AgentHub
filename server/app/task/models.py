@@ -15,6 +15,10 @@ class TaskCreateIn(BaseModel):
     name: str = Field(default="", max_length=200)
     target_device_id: str | None = Field(default=None, max_length=36)
     steps: list[StepIn] = Field(min_length=1)
+    # V1.3 task provenance (§32/§33): API | AGENT | WORKFLOW | MANUAL
+    source_type: str | None = Field(default=None, max_length=32)
+    workflow_run_id: str | None = Field(default=None, max_length=64)
+    workflow_step_run_id: str | None = Field(default=None, max_length=64)
 
 
 class StepOut(BaseModel):
