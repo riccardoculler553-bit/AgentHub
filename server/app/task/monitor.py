@@ -60,7 +60,12 @@ class TaskMonitor:
                 if now - task.created_at > max_wait:
                     svc.timeout_pending(task)
                     logger.warning("task %s TIMEOUT (device offline max wait elapsed)", task.task_id)
-                elif task.target_device_id and self.hub.is_device_online(task.target_device_id):
+                elif task.execution_type == "CAPABILITY" or (
+                    task.target_device_id and self.hub.is_device_online(task.target_device_id)
+                ):
+                    # V1.4 §65: capability tasks resolve their worker at
+                    # dispatch time - a None target just means "no eligible
+                    # worker yet"; let the dispatcher's resolver retry.
                     dispatchable.append(task.task_id)
         for task_id in dispatchable:
             await self.dispatcher.dispatch_task(task_id)

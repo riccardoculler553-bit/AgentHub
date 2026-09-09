@@ -51,6 +51,11 @@ from heartbeat import HeartbeatManager
 from identity import DeviceIdentity, IdentityManager
 from reconnect import ReconnectManager
 from websocket import AUTH_CLOSE_CODES, WebSocketClient
+from worker.capability.cache import CapabilityCache
+from worker.capability.local_registry import scan_installed
+from worker.capability.manager import CapabilityManager
+from worker.capability.puller import PackagePuller
+from worker.capability.uploader import ArtifactUploader
 from worker.manager import TaskManager
 from worker.registry import reportable_capabilities
 
@@ -63,7 +68,19 @@ class DeviceClient:
         self.identities = IdentityManager()
         self.identity: DeviceIdentity | None = None
         self.reconnector = ReconnectManager()
-        self.task_manager = TaskManager()
+        # V1.4 Lazy Pull (§18/§51): shared by worker.capabilities reporting and
+        # the TaskManager capability path. Token is read lazily because the
+        # identity loads before connect.
+        self.capability_manager = CapabilityManager(
+            CapabilityCache(),
+            PackagePuller(server_url, lambda: self.identity.token if self.identity else ""),
+        )
+        self.task_manager = TaskManager(
+            capability_manager=self.capability_manager,
+            artifact_uploader=ArtifactUploader(
+                server_url, lambda: self.identity.token if self.identity else ""
+            ),
+        )
         self._capabilities = reportable_capabilities()
         self._caps_reported = False
         self._stop = asyncio.Event()
@@ -101,10 +118,21 @@ class DeviceClient:
                 await self.ws_client.send(caps)
                 self._caps_reported = True
                 print(f"[worker] capabilities reported: {[c['name'] for c in self._capabilities]}")
+            # V1.4 §17: installed automation capability packages (every connect -
+            # Lazy Pull may have changed the local set since the last report).
+            installed = scan_installed()
+            await self.ws_client.send(
+                protocol.build_envelope("worker.capabilities", {"capabilities": installed})
+            )
+            if installed:
+                packages = ", ".join(f"{c['name']}@{c['version']}" for c in installed)
+                print(f"[worker] capability packages reported: {packages}")
         elif msg_type == "task.dispatch":
             await self.task_manager.on_dispatch(envelope)
         elif msg_type == "task.cancel":
             await self.task_manager.on_cancel(envelope.get("data", {}))
+        elif msg_type == "capability.execute":
+            await self.task_manager.on_capability_execute(envelope)
         elif msg_type == "error":
             print(f"[ws] server error envelope: {json.dumps(envelope.get('data', {}), ensure_ascii=False)}")
         else:
@@ -117,6 +145,7 @@ class DeviceClient:
             self.register(self.registration_code)
         else:
             print(f"[identity] loaded device_id={self.identity.device_id}")
+        self.task_manager.worker_id = self.identity.device_id  # §41 Execution Context
 
         self.task_manager.ensure_consumer()
 

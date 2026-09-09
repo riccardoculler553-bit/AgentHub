@@ -28,6 +28,12 @@ class WorkflowStepDefinition(BaseModel):
     command: str = Field(min_length=1, max_length=128, description="命令注册表中的命令名")
     params: dict = Field(default_factory=dict, description="支持 {{ variables.x }} / {{ steps.<name>.result.x }} 模板")
     device_id: str | None = Field(default=None, max_length=36, description="固定设备；为空则由引擎选择有能力的在线设备")
+    # V1.4 §24: set -> capability step (command doubles as capability_name,
+    # params holds capability_params). None keeps the V1.3 command step.
+    capability_version: str | None = Field(
+        default=None, max_length=32, pattern=VERSION_PATTERN,
+        description="设置后该步骤为 Capability 步骤（command 即 capability 名称，固定执行版本）；为空表示 V1.3 命令步骤",
+    )
     on_failure: Literal["stop", "retry"] = "stop"
     retry_policy: RetryPolicyIn = Field(default_factory=RetryPolicyIn)
     enabled: bool = True
@@ -74,6 +80,7 @@ class WorkflowStepRunOut(BaseModel):
     name: str
     order_no: int
     command: str
+    capability_version: str | None = None
     status: str
     task_id: str | None
     retry_count: int

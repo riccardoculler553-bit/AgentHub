@@ -17,7 +17,12 @@ _END_OF_STREAM: tuple[type[Exception], ...] = (
 
 
 class FakeWorker:
-    """behaviour: "success" | "fail" | "silent" | "caps_only"."""
+    """behaviour: "success" | "fail" | "silent" | "caps_only".
+
+    V1.4: capability.execute envelopes are auto-answered with the capability
+    lifecycle (accept -> running -> result); when capability_artifact is set,
+    a fake artifact is uploaded over HTTP before the result is reported.
+    """
 
     def __init__(
         self,
@@ -26,12 +31,18 @@ class FakeWorker:
         capabilities=("echo",),
         behaviour: str = "success",
         max_dispatches: int = 8,
+        capability_artifact: bytes | None = None,
+        installed_capabilities: list[dict] | None = None,
     ) -> None:
         self.client = client
         self.token = token
         self.capabilities = list(capabilities)
         self.behaviour = behaviour
         self.max_dispatches = max_dispatches
+        self.capability_artifact = capability_artifact
+        # V1.4 §17: installed automation capability packages to report via
+        # worker.capabilities, e.g. [{"name": "a.b.c", "version": "1.0.0"}]
+        self.installed_capabilities = installed_capabilities
         self.received: list[dict] = []
         self.errors: list[Exception] = []
         self._session = None
@@ -85,14 +96,28 @@ class FakeWorker:
                 }
             )
             self.received.append(session.receive_json())  # message_ack
+            if self.installed_capabilities is not None:
+                session.send_json(
+                    {
+                        "id": "wcap_1",
+                        "type": "worker.capabilities",
+                        "version": 1,
+                        "timestamp": 1,
+                        "data": {"capabilities": list(self.installed_capabilities)},
+                    }
+                )
+                self.received.append(session.receive_json())  # message_ack
             if self.behaviour == "caps_only":
                 return
             for _ in range(self.max_dispatches):
                 msg = session.receive_json()
                 self.received.append(msg)
-                if msg.get("type") != "task.dispatch" or self.behaviour == "silent":
+                if self.behaviour == "silent":
                     continue
-                self._answer(session, msg["data"])
+                if msg.get("type") == "task.dispatch":
+                    self._answer(session, msg["data"])
+                elif msg.get("type") == "capability.execute":
+                    self._answer_capability(session, msg["data"])
         except WebSocketDisconnect:
             pass  # expected when stop() closes the session
         except _END_OF_STREAM as exc:
@@ -133,6 +158,60 @@ class FakeWorker:
                     "result": {"echo": data.get("params", {}).get("message")},
                 },
             )
+
+    def _answer_capability(self, session, data: dict) -> None:
+        """V1.4 §65: capability lifecycle over the Task state machine."""
+        task_id, step_id = data["task_id"], data["step_id"]
+        attempt_id = data.get("attempt_id", "")
+        capability = data.get("capability", "")
+
+        def send(msg_id: str, msg_type: str, payload: dict) -> None:
+            session.send_json({"id": msg_id, "type": msg_type, "version": 1, "timestamp": 1, "data": payload})
+            self.received.append(session.receive_json())  # message_ack
+
+        accept = {
+            "task_id": task_id, "step_id": step_id, "attempt_id": attempt_id,
+            "capability": capability, "version": data.get("version", ""),
+        }
+        send("c1", "capability.accept", accept)
+        send("c2", "capability.running", dict(accept))
+        if self.behaviour == "fail":
+            send(
+                "c3",
+                "capability.result",
+                {
+                    "task_id": task_id, "step_id": step_id, "attempt_id": attempt_id, "status": "failed",
+                    "error": {"code": "CAPABILITY_EXECUTION_FAILED", "message": "capability boom"},
+                },
+            )
+            return
+        artifacts = []
+        if self.capability_artifact is not None:
+            upload = self.client.post(
+                "/api/artifacts",
+                files={"file": ("report.txt", self.capability_artifact, "text/plain")},
+                data={
+                    "name": "report.txt",
+                    "type": "file",
+                    "task_id": task_id,
+                    "workflow_run_id": data.get("workflow_run_id") or "",
+                    "step_run_id": data.get("step_run_id") or "",
+                },
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            if upload.status_code == 201:
+                body = upload.json()
+                artifacts.append({"artifact_id": body["artifact_id"], "name": body["name"], "type": body["type"]})
+            else:
+                self.errors.append(RuntimeError(f"artifact upload failed: HTTP {upload.status_code}"))
+        send(
+            "c3",
+            "capability.result",
+            {
+                "task_id": task_id, "step_id": step_id, "attempt_id": attempt_id, "status": "success",
+                "result": {"capability": capability, "artifacts": artifacts},
+            },
+        )
 
 
 def register_device(client, name: str) -> dict:

@@ -20,7 +20,7 @@ from app.workflow.errors import (
     WorkflowNotFound,
     WorkflowVersionNotFound,
 )
-from app.workflow.schemas import WorkflowDefinitionIn
+from app.workflow.schemas import WorkflowDefinitionIn, WorkflowStepDefinition
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
@@ -70,6 +70,7 @@ class WorkflowRegistry:
                     name=step.name,
                     order_no=order_no,
                     command=step.command,
+                    capability_version=step.capability_version,
                     params=step.params,
                     device_id=step.device_id,
                     on_failure=step.on_failure,
@@ -96,7 +97,12 @@ class WorkflowRegistry:
         command_service = CommandService(self.db)
         for index, step in enumerate(definition.steps, start=1):
             if not _NAME_RE.match(step.name):
-                problems.append(f"step {index}: invalid step name: {step.name}")
+                problems.append(f"step {index} ({step.name}): invalid step name: {step.name}")
+            if step.capability_version is not None:
+                # V1.4 §24: capability step - command doubles as the capability
+                # name and must exist with the pinned version PUBLISHED.
+                problems.extend(self._validate_capability_step(index, step.name, step))
+                continue
             try:
                 command_service.require_executable(step.command)
             except CommandNotFound:
@@ -106,6 +112,16 @@ class WorkflowRegistry:
             except CommandError as exc:  # defensive: registry layer error
                 problems.append(f"step {index} ({step.name}): {exc}")
         return problems
+
+    def _validate_capability_step(self, index: int, step_name: str, step: WorkflowStepDefinition) -> list[str]:
+        from app.capability_runtime.errors import CapabilityError
+        from app.capability_runtime.service import CapabilityService
+
+        try:
+            CapabilityService(self.db).get_published_version(step.command, step.capability_version)
+        except CapabilityError as exc:
+            return [f"step {index} ({step_name}): {exc}"]
+        return []
 
     # ----------------------------------------------------------------- query
 

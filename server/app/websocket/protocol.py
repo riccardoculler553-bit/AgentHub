@@ -31,6 +31,13 @@ class MessageType(StrEnum):
     TASK_RESULT = "task.result"              # device -> server (terminal)
     TASK_CANCEL = "task.cancel"              # server -> device
     DEVICE_CAPABILITIES = "device.capabilities"  # device -> server (capability report)
+    # --- AgentHub V1.4 Capability Runtime (§65/§66) ---
+    CAPABILITY_EXECUTE = "capability.execute"    # server -> device (dispatch)
+    CAPABILITY_ACCEPT = "capability.accept"      # device -> server (Task ACK)
+    CAPABILITY_RUNNING = "capability.running"    # device -> server
+    CAPABILITY_PROGRESS = "capability.progress"  # device -> server
+    CAPABILITY_RESULT = "capability.result"      # device -> server (terminal)
+    WORKER_CAPABILITIES = "worker.capabilities"  # device -> server (installed packages)
 
 
 class ProtocolError(ValueError):

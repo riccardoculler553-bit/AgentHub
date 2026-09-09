@@ -1,14 +1,22 @@
 """TaskManager: worker-side task lifecycle (PDF §37-§38/§74-§77/§108-§110).
 
 Responsibilities:
-- receive task.dispatch, dedup by (task_id, step_id) in-memory AND by
-  attempt_id in the local ExecutionLedger (SQLite) - idempotent execution
+- receive task.dispatch AND capability.execute (V1.4), dedup by
+  (task_id, step_id) in-memory AND by attempt_id in the local ExecutionLedger
+  (SQLite) - idempotent execution
 - concurrency control: one task at a time (max_concurrency = 1)
-- task.accept / task.running / task.progress / task.result reporting with
+- task.* / capability.* accept/running/progress/result reporting with
   attempt_id echoed back on every envelope
 - cancel handling (terminate subprocesses, cleanup, report)
 - recovery: unacknowledged terminal results are re-reported after reconnect;
   attempts left RUNNING by a dead process are parked FAILED at startup
+
+V1.4 capability path (§43/§51/§65): on capability.execute the manager first
+guarantees the package via CapabilityManager.ensure (Lazy Pull, per-version
+package lock), then resolves the runtime executor from the manifest and runs
+with an ExecutionContext; artifact files are uploaded and replaced by
+artifact references before capability.result is reported (§45). Retry/
+timeout/cancel policy stays with the server Task Engine (§67/§68/§69).
 
 The WebSocket loop is NEVER blocked: executions run on a single consumer task
 fed by an asyncio.Queue, subprocess work happens in executor code that polls
@@ -19,9 +27,15 @@ connection (PDF §108-§109).
 import asyncio
 import logging
 import sys
+from dataclasses import dataclass, field
 from typing import Any
 
 import protocol
+from worker.capability.context import ExecutionContext
+from worker.capability.executors import create_executor
+from worker.capability.manager import CapabilityInstallError
+from worker.capability.result import CapabilityResult
+from worker.capability.uploader import ArtifactUploadFailed
 from worker.executor import ExecutionError
 from worker.ledger import ExecutionLedger
 from worker.registry import build_command_registry
@@ -29,10 +43,30 @@ from worker.registry import build_command_registry
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _Outcome:
+    """Normalized execution outcome feeding ledger + result report."""
+
+    terminal: str  # "success" | "failed" | "cancelled"
+    ledger_status: str = "FAILED"  # SUCCESS | FAILED | TIMEOUT | CANCELLED
+    result: dict | None = None
+    error: dict | None = None
+    metrics: dict = field(default_factory=dict)
+
+
 class TaskManager:
-    def __init__(self, max_concurrency: int = 1, ledger: ExecutionLedger | None = None) -> None:
+    def __init__(
+        self,
+        max_concurrency: int = 1,
+        ledger: ExecutionLedger | None = None,
+        capability_manager=None,
+        artifact_uploader=None,
+    ) -> None:
         self.registry = build_command_registry()
         self.ledger = ledger or ExecutionLedger()
+        self.capability_manager = capability_manager
+        self.artifact_uploader = artifact_uploader
+        self.worker_id = ""
         self.max_concurrency = max(1, max_concurrency)
         self._active: dict[tuple[str, str], dict[str, Any]] = {}  # (task_id, step_id) -> state
         self._queue: asyncio.Queue = asyncio.Queue()
@@ -64,6 +98,8 @@ class TaskManager:
             logger.exception("ledger scan failed")
             return
         for row in pending:
+            # Capability rows are stored as "capability:<name>@<version>".
+            kind = "capability" if str(row["command"]).startswith("capability:") else "task"
             await self._report_result(
                 task_id=row["task_id"],
                 step_id=row["step_id"],
@@ -72,18 +108,36 @@ class TaskManager:
                 result=json_or_none(row["result"]),
                 error_code=row["error_code"],
                 error_message=row["error_message"],
+                kind=kind,
                 ledger_row_id=row["attempt_id"],
             )
 
     # ------------------------------------------------------------------ intake
 
     async def on_dispatch(self, envelope: dict) -> None:
+        await self._intake(envelope, kind="task")
+
+    async def on_capability_execute(self, envelope: dict) -> None:
+        """V1.4 §65: capability.execute shares the Task state machine."""
+        await self._intake(envelope, kind="capability")
+
+    async def _intake(self, envelope: dict, kind: str) -> None:
         data = envelope.get("data", {})
         task_id = str(data.get("task_id", ""))
         step_id = str(data.get("step_id", ""))
         attempt_id = str(data.get("attempt_id", ""))
-        command = str(data.get("command", ""))
         params = data.get("params") or {}
+        if kind == "capability":
+            capability = str(data.get("capability", ""))
+            version = str(data.get("version", ""))
+            # Ledger command column carries the capability identity (used by
+            # the reconnect flush to pick the result envelope type).
+            command = f"capability:{capability}@{version}"
+            display = command.removeprefix("capability:")
+        else:
+            capability = version = ""
+            command = str(data.get("command", ""))
+            display = command
         if not task_id or not step_id:
             return
         if not attempt_id:
@@ -105,7 +159,7 @@ class TaskManager:
                     attempt_id, task_id, step_id, active["attempt_id"],
                 )
                 await self._report(
-                    "task.running",
+                    f"{active['kind']}.running",
                     {"task_id": task_id, "step_id": step_id, "attempt_id": active["attempt_id"]},
                 )
                 return
@@ -114,7 +168,7 @@ class TaskManager:
                 "duplicate dispatch for %s/%s (already %s)", task_id, step_id, active["status"]
             )
             await self._report(
-                "task.running",
+                f"{active['kind']}.running",
                 {"task_id": task_id, "step_id": step_id, "attempt_id": active["attempt_id"]},
             )
             return
@@ -130,56 +184,81 @@ class TaskManager:
                     result=json_or_none(row.get("result")),
                     error_code=row.get("error_code"),
                     error_message=row.get("error_message"),
+                    kind=kind,
                     ledger_row_id=attempt_id,
                 )
             else:
                 await self._report(
-                    "task.running",
+                    f"{kind}.running",
                     {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id},
                 )
             return
 
-        executor = self.registry.get(command)
-        if executor is None:
-            logger.warning("no local executor for command %s", command)
-            self.ledger.mark_finished(
-                attempt_id, "FAILED", error_code="COMMAND_NOT_FOUND",
-                error_message=f"worker has no executor for {command}",
-            )
-            await self._report_result(
-                task_id, step_id, attempt_id, "failed",
-                error_code="COMMAND_NOT_FOUND",
-                error_message=f"worker has no executor for {command}",
-                ledger_row_id=attempt_id,
-            )
-            return
-
-        try:
-            executor.validate(params)
-        except ValueError as exc:
-            self.ledger.mark_finished(
-                attempt_id, "FAILED", error_code="INVALID_PARAMS", error_message=str(exc)
-            )
-            await self._report_result(
-                task_id, step_id, attempt_id, "failed",
-                error_code="INVALID_PARAMS", error_message=str(exc),
-                ledger_row_id=attempt_id,
-            )
-            return
-
-        self._active[(task_id, step_id)] = {
+        state: dict[str, Any] = {
             "task_id": task_id,
             "step_id": step_id,
             "attempt_id": attempt_id,
             "command": command,
             "params": params,
             "timeout": data.get("timeout"),
-            "executor": executor,
+            "kind": kind,
             "cancel": asyncio.Event(),
             "status": "queued",
+            "workflow_run_id": data.get("workflow_run_id"),
+            "step_run_id": data.get("step_run_id"),
         }
+        if kind == "task":
+            executor = self.registry.get(command)
+            if executor is None:
+                logger.warning("no local executor for command %s", command)
+                self.ledger.mark_finished(
+                    attempt_id, "FAILED", error_code="COMMAND_NOT_FOUND",
+                    error_message=f"worker has no executor for {command}",
+                )
+                await self._report_result(
+                    task_id, step_id, attempt_id, "failed",
+                    error_code="COMMAND_NOT_FOUND",
+                    error_message=f"worker has no executor for {command}",
+                    ledger_row_id=attempt_id,
+                )
+                return
+            try:
+                executor.validate(params)
+            except ValueError as exc:
+                self.ledger.mark_finished(
+                    attempt_id, "FAILED", error_code="INVALID_PARAMS", error_message=str(exc)
+                )
+                await self._report_result(
+                    task_id, step_id, attempt_id, "failed",
+                    error_code="INVALID_PARAMS", error_message=str(exc),
+                    ledger_row_id=attempt_id,
+                )
+                return
+            state["executor"] = executor
+        else:
+            state.update(
+                capability=str(data.get("capability", "")),
+                version=str(data.get("version", "")),
+                package_id=str(data.get("package_id", "")),
+                checksum=str(data.get("checksum") or "") or None,
+            )
+            if not state["capability"] or not state["version"]:
+                self.ledger.mark_finished(
+                    attempt_id, "FAILED", error_code="INVALID_PARAMS",
+                    error_message="capability.execute missing capability/version",
+                )
+                await self._report_result(
+                    task_id, step_id, attempt_id, "failed",
+                    error_code="INVALID_PARAMS",
+                    error_message="capability.execute missing capability/version",
+                    kind=kind,
+                    ledger_row_id=attempt_id,
+                )
+                return
+
+        self._active[(task_id, step_id)] = state
         await self._report(
-            "task.accept", {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id}
+            f"{kind}.accept", {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id}
         )
         self.ensure_consumer()
         await self._queue.put((task_id, step_id))
@@ -221,52 +300,158 @@ class TaskManager:
 
         async def progress(pct: int, message: str) -> None:
             await self._report(
-                "task.progress",
+                f"{state['kind']}.progress",
                 {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id,
                  "progress": int(pct), "message": message},
             )
 
         await self._report(
-            "task.running", {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id}
+            f"{state['kind']}.running", {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id}
         )
         cancel: asyncio.Event = state["cancel"]
+        try:
+            if state["kind"] == "capability":
+                outcome = await self._run_capability(state, progress)
+            else:
+                outcome = await self._run_task(state, progress)
+        except Exception as exc:  # defensive: never let the consumer die
+            logger.exception("executor crashed")
+            outcome = _Outcome("failed", error={"code": "EXECUTOR_FAILED", "message": str(exc)[:500]})
+
+        if cancel.is_set() and outcome.terminal == "success":
+            # Executor returned success but a cancel raced in: honour cancel.
+            outcome = _Outcome("cancelled")
+
+        if outcome.terminal == "success":
+            self.ledger.mark_finished(attempt_id, "SUCCESS", result=outcome.result)
+            await self._report_result(
+                task_id, step_id, attempt_id, "success", result=outcome.result,
+                kind=state["kind"], ledger_row_id=attempt_id,
+            )
+            logger.info("task %s/%s SUCCESS", task_id, step_id)
+        elif outcome.terminal == "cancelled":
+            self.ledger.mark_finished(attempt_id, "CANCELLED")
+            await self._report_result(
+                task_id, step_id, attempt_id, "cancelled", kind=state["kind"], ledger_row_id=attempt_id
+            )
+        else:
+            error = outcome.error or {"code": "EXECUTOR_FAILED", "message": "execution failed"}
+            ledger_status = "TIMEOUT" if error.get("code") == "EXECUTOR_TIMEOUT" else "FAILED"
+            self.ledger.mark_finished(
+                attempt_id, ledger_status, error_code=error.get("code"), error_message=error.get("message")
+            )
+            await self._report_result(
+                task_id, step_id, attempt_id, "failed",
+                error_code=error.get("code"), error_message=error.get("message"),
+                kind=state["kind"], ledger_row_id=attempt_id,
+            )
+            logger.error("task %s/%s %s (%s)", task_id, step_id, ledger_status, error.get("code"))
+
+    # ------------------------------------------------------------- legacy task
+
+    async def _run_task(self, state: dict, progress) -> _Outcome:
+        cancel = state["cancel"]
         config = {"__command__": state["command"], "timeout": state.get("timeout")}
         try:
             result = await state["executor"].execute(state["params"], config, progress, cancel)
             if cancel.is_set():
-                self.ledger.mark_finished(attempt_id, "CANCELLED")
-                await self._report_result(task_id, step_id, attempt_id, "cancelled", ledger_row_id=attempt_id)
-            else:
-                self.ledger.mark_finished(attempt_id, "SUCCESS", result=result)
-                await self._report_result(
-                    task_id, step_id, attempt_id, "success", result=result, ledger_row_id=attempt_id
-                )
-                logger.info("task %s/%s SUCCESS", task_id, step_id)
+                return _Outcome("cancelled", ledger_status="CANCELLED")
+            return _Outcome("success", ledger_status="SUCCESS", result=result)
         except ExecutionError as exc:
             if exc.code == "EXECUTOR_CANCELLED" or cancel.is_set():
-                self.ledger.mark_finished(attempt_id, "CANCELLED")
-                await self._report_result(task_id, step_id, attempt_id, "cancelled", ledger_row_id=attempt_id)
-            elif exc.code == "EXECUTOR_TIMEOUT":
-                self.ledger.mark_finished(attempt_id, "TIMEOUT", error_code=exc.code, error_message=exc.message)
-                await self._report_result(
-                    task_id, step_id, attempt_id, "failed",
-                    error_code=exc.code, error_message=exc.message, ledger_row_id=attempt_id,
-                )
-                logger.error("task %s/%s TIMEOUT", task_id, step_id)
-            else:
-                self.ledger.mark_finished(attempt_id, "FAILED", error_code=exc.code, error_message=exc.message)
-                await self._report_result(
-                    task_id, step_id, attempt_id, "failed",
-                    error_code=exc.code, error_message=exc.message, ledger_row_id=attempt_id,
-                )
-                logger.error("task %s/%s FAILED (%s)", task_id, step_id, exc.code)
-        except Exception as exc:  # defensive: never let the consumer die
-            logger.exception("executor crashed")
-            self.ledger.mark_finished(attempt_id, "FAILED", error_code="EXECUTOR_FAILED", error_message=str(exc)[:500])
-            await self._report_result(
-                task_id, step_id, attempt_id, "failed",
-                error_code="EXECUTOR_FAILED", error_message=str(exc)[:500], ledger_row_id=attempt_id,
+                return _Outcome("cancelled", ledger_status="CANCELLED")
+            if exc.code == "EXECUTOR_TIMEOUT":
+                return _Outcome("failed", ledger_status="TIMEOUT",
+                                error={"code": exc.code, "message": exc.message})
+            return _Outcome("failed", ledger_status="FAILED",
+                            error={"code": exc.code, "message": exc.message})
+
+    # ------------------------------------------------------ capability (V1.4)
+
+    async def _run_capability(self, state: dict, progress) -> _Outcome:
+        """§43 Worker 本地执行流程: prepare package -> run -> upload -> normalize."""
+        name, version = state["capability"], state["version"]
+        if self.capability_manager is None:
+            return _Outcome("failed", error={
+                "code": "CAPABILITY_RUNTIME_UNAVAILABLE",
+                "message": "capability manager not configured on this worker",
+            })
+        try:
+            await progress(5, f"preparing {name}@{version}")
+            installed = await self.capability_manager.ensure(
+                name, version, state["package_id"], state["checksum"]
             )
+            await progress(20, "package ready")
+            executor = create_executor(installed.manifest.runtime)
+            executor.validate(installed.manifest, state["params"])
+        except CapabilityInstallError as exc:
+            return _Outcome("failed", error={"code": exc.code, "message": str(exc)[:500]})
+        except ValueError as exc:
+            return _Outcome("failed", error={"code": "INVALID_PARAMS", "message": str(exc)[:500]})
+
+        context = ExecutionContext(
+            execution_id=state["attempt_id"],  # §41: execution_id == attempt_id
+            task_id=state["task_id"],
+            step_id=state["step_id"],
+            attempt_id=state["attempt_id"],
+            capability=name,
+            version=version,
+            worker_id=self.worker_id,
+            params=state["params"],
+            manifest=installed.manifest,
+            package_dir=installed.path,
+            workflow_run_id=state.get("workflow_run_id"),
+            step_run_id=state.get("step_run_id"),
+            timeout=int(state.get("timeout") or 600),
+        )
+        result = await executor.execute(context, progress, state["cancel"])
+        if not isinstance(result, CapabilityResult):  # defensive against runtimes
+            result = CapabilityResult.ok(data={"output": str(result)[:2000]})
+
+        if result.success and result.artifact_files:
+            await progress(95, "uploading artifacts")
+            refs = await self._upload_artifacts(state, result.artifact_files)
+            if isinstance(refs, _Outcome):  # upload failed
+                return refs
+            result.artifacts = refs
+
+        payload = result.to_payload()
+        if result.success:
+            return _Outcome("success", ledger_status="SUCCESS", result=payload)
+        if payload.get("error_code") == "CAPABILITY_CANCELLED" or state["cancel"].is_set():
+            return _Outcome("cancelled", ledger_status="CANCELLED")
+        return _Outcome("failed", error={
+            "code": payload.get("error_code") or "CAPABILITY_EXECUTION_FAILED",
+            "message": str(payload.get("message", ""))[:500],
+        })
+
+    async def _upload_artifacts(self, state: dict, files) -> list[dict] | _Outcome:
+        """Upload produced files (§45: the result only carries artifact IDs)."""
+        if self.artifact_uploader is None:
+            return _Outcome("failed", error={
+                "code": "ARTIFACT_UPLOAD_FAILED",
+                "message": "artifact uploader not configured on this worker",
+            })
+        refs: list[dict] = []
+        for upload_name, path in files:
+            try:
+                uploaded = await self.artifact_uploader.upload(
+                    path,
+                    name=upload_name,
+                    task_id=state["task_id"],
+                    workflow_run_id=state.get("workflow_run_id"),
+                    step_run_id=state.get("step_run_id"),
+                )
+            except ArtifactUploadFailed as exc:
+                return _Outcome("failed", error={
+                    "code": "ARTIFACT_UPLOAD_FAILED", "message": str(exc)[:500],
+                })
+            refs.append({
+                "artifact_id": uploaded.get("artifact_id", ""),
+                "name": uploaded.get("name", upload_name),
+                "type": uploaded.get("type", "file"),
+            })
+        return refs
 
     # ------------------------------------------------------------------ report
 
@@ -292,16 +477,18 @@ class TaskManager:
         result: dict | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
+        kind: str = "task",
         ledger_row_id: str | None = None,
     ) -> None:
-        """task.result with attempt_id (PDF §41). The ledger 'reported' flag is
-        only set after a successful send, so reconnect re-reports lost ones."""
+        """task.result / capability.result with attempt_id (PDF §41, V1.4 §65).
+        The ledger 'reported' flag is only set after a successful send, so
+        reconnect re-reports lost ones."""
         data: dict = {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id, "status": status}
         if result is not None:
             data["result"] = result
         if error_code:
             data["error"] = {"code": error_code, "message": error_message or ""}
-        sent = await self._report("task.result", data)
+        sent = await self._report(f"{kind}.result", data)
         if sent and ledger_row_id:
             try:
                 self.ledger.mark_reported(ledger_row_id)
@@ -323,7 +510,7 @@ def json_or_none(raw) -> dict | None:
 
 
 def _ledger_status_to_result(status: str) -> str:
-    # Ledger terminal status -> task.result status word.
+    # Ledger terminal status -> result status word.
     if status == "SUCCESS":
         return "success"
     if status == "CANCELLED":

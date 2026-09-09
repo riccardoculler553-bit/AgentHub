@@ -45,7 +45,19 @@ class TaskService:
 
     def create(self, payload: TaskCreateIn, created_by: str = "admin") -> Task:
         """Validate the ExecutionPlan against Registry/Validator, then persist
-        Task + Steps + first event. Task starts in PENDING."""
+        Task + Steps + first event. Task starts in PENDING.
+
+        V1.4 §32/§73: two execution types share the same Task Engine.
+        - LEGACY_COMMAND: V1.0-V1.3 behavior (device + command registry).
+        - CAPABILITY: the step command is an automation capability name; the
+          device may be omitted and gets resolved by the CapabilityResolver at
+          dispatch time (Lazy Pull installs it on the worker, §52)."""
+        execution_type = payload.execution_type or "LEGACY_COMMAND"
+        if execution_type == "CAPABILITY":
+            return self._create_capability_task(payload, created_by)
+        return self._create_command_task(payload, created_by)
+
+    def _create_command_task(self, payload: TaskCreateIn, created_by: str) -> Task:
         problems: list[str] = []
         if payload.target_device_id is None:
             problems.append("target_device_id is required in V1.0")
@@ -96,6 +108,7 @@ class TaskService:
             source_type=payload.source_type or ("AGENT" if created_by == "tool_agent" else "API"),
             workflow_run_id=payload.workflow_run_id,
             workflow_step_run_id=payload.workflow_step_run_id,
+            execution_type="LEGACY_COMMAND",
         )
         self.db.add(task)
         for index, step in enumerate(payload.steps, start=1):
@@ -112,6 +125,85 @@ class TaskService:
             )
         self.db.flush()
         self._record(task.task_id, "task.created", payload={"name": task.name, "steps": len(payload.steps)})
+        self.db.commit()
+        return task
+
+    def _create_capability_task(self, payload: TaskCreateIn, created_by: str) -> Task:
+        """V1.4 CAPABILITY task (§21/§32): exactly one step whose command is
+        the capability name. Validation covers capability existence + a
+        PUBLISHED version; the worker is resolved at dispatch time."""
+        from app.capability_runtime.errors import CapabilityError
+        from app.capability_runtime.service import CapabilityService
+
+        problems: list[str] = []
+        if len(payload.steps) != 1:
+            problems.append("a CAPABILITY task takes exactly one capability step")
+            capability_step = None
+        else:
+            capability_step = payload.steps[0]
+
+        capability = None
+        if capability_step is not None:
+            try:
+                service = CapabilityService(self.db)
+                capability = service.require_capability(capability_step.command)
+                if not capability.enabled:
+                    from app.capability_runtime.errors import CapabilityDisabled
+
+                    raise CapabilityDisabled(capability.name)
+                published = service.get_published_version(capability.name, payload.capability_version)
+                # Pin the concrete version that will run (§56 reproducibility).
+                payload.capability_version = published.version
+            except CapabilityError as exc:
+                problems.append(f"step 1: {exc}")
+
+        device = None
+        if payload.target_device_id is not None:
+            try:
+                device = DeviceService(self.db).get_device(payload.target_device_id)
+            except DeviceNotFound:
+                problems.append(f"target device not found: {payload.target_device_id}")
+            else:
+                if device.revoked_at is not None:
+                    problems.append(f"target device is revoked: {payload.target_device_id}")
+        if problems or capability_step is None:
+            raise TaskValidationFailed(problems or ["capability step missing"])
+
+        task = Task(
+            task_id=_new_id("task"),
+            name=payload.name or capability_step.command,
+            created_by=created_by,
+            target_device_id=device.device_id if device else None,
+            status="PENDING",
+            max_attempts=settings.task_max_attempts,
+            source_type=payload.source_type or ("AGENT" if created_by == "tool_agent" else "API"),
+            workflow_run_id=payload.workflow_run_id,
+            workflow_step_run_id=payload.workflow_step_run_id,
+            execution_type="CAPABILITY",
+            capability_name=capability.name,
+            capability_version=payload.capability_version,
+            artifact_ids=[],
+        )
+        self.db.add(task)
+        self.db.add(
+            TaskStep(
+                step_id=_new_id("step"),
+                task_id=task.task_id,
+                order_no=1,
+                device_id=device.device_id if device else None,
+                command=capability_step.command,
+                params=capability_step.params,
+                status="PENDING",
+            )
+        )
+        self.db.flush()
+        self._record(
+            task.task_id, "task.created",
+            payload={
+                "name": task.name, "steps": 1, "execution_type": "CAPABILITY",
+                "capability": task.capability_name, "capability_version": task.capability_version,
+            },
+        )
         self.db.commit()
         return task
 
@@ -294,6 +386,15 @@ class TaskService:
                     if can_transition("task", task.status, "SUCCESS"):
                         task.status = "SUCCESS"
                         task.finished_at = now
+                        # V1.4 §45: collect artifact references from the final
+                        # capability result so the Task row is self-contained.
+                        artifact_refs = [
+                            str(a.get("artifact_id"))
+                            for a in (result.get("artifacts") or [])
+                            if isinstance(a, dict) and a.get("artifact_id")
+                        ]
+                        if artifact_refs:
+                            task.artifact_ids = artifact_refs
                         self._record(task_id, "task.success", step_id=step_id, attempt_id=attempt_id, payload={"result": result})
                     else:
                         # Illegal (e.g. task CANCELLED mid-flight): audit only.

@@ -53,13 +53,6 @@ class TaskDispatcher:
             db.expire_all()  # re-read the freshly claimed task
             task = service.get(task_id)
 
-            if task.target_device_id is None:
-                # Defensive: create() enforces a target device in V1.0.
-                task.status = "FAILED"
-                task.finished_at = utcnow()
-                service._record(task_id, "task.failed", payload={"error_code": "TASK_VALIDATION", "error_message": "target_device_id is required"})
-                db.commit()
-                return False
             step = service.next_pending_step(task_id)
             if step is None:
                 # Every step already terminal (raced a final result while we
@@ -69,6 +62,20 @@ class TaskDispatcher:
                 service._record(task_id, "task.failed", payload={"error_code": "NO_PENDING_STEP", "error_message": "no PENDING step to dispatch"})
                 db.commit()
                 return False
+
+            # ---- V1.4 Capability Runtime branch (§21/§51/§65): resolves its
+            # own worker, so it must run BEFORE the legacy device check.
+            if task.execution_type == "CAPABILITY":
+                return await self._dispatch_capability(db, service, task, step)
+
+            if task.target_device_id is None:
+                # Defensive: create() enforces a target device in V1.0.
+                task.status = "FAILED"
+                task.finished_at = utcnow()
+                service._record(task_id, "task.failed", payload={"error_code": "TASK_VALIDATION", "error_message": "target_device_id is required"})
+                db.commit()
+                return False
+
             device_id = task.target_device_id
 
             if not self.device_link.is_online(device_id):
@@ -160,3 +167,130 @@ class TaskDispatcher:
             db.commit()
             logger.info("task %s step %s dispatched (attempt %s, %s connection(s))", task_id, step.step_id, attempt.attempt_no, sent)
             return True
+
+    # ------------------------------------------------------------- capability
+
+    async def _dispatch_capability(self, db, service, task: Task, step: TaskStep) -> bool:
+        """Dispatch a CAPABILITY task (V1.4 §21/§51/§65).
+
+        Server resolves capability -> version -> worker (§21), then hands the
+        execution to the worker with package identity so Lazy Pull can verify
+        checksums. Retry/timeout/cancel stay with the Task Engine (§67/§69)."""
+        from app.capability_runtime.errors import CapabilityError, CapabilityNoWorker
+        from app.capability_runtime.package_service import PackageService
+        from app.capability_runtime.resolver import CapabilityResolver
+        from app.capability_runtime.service import CapabilityService
+        from app.core.config import settings
+
+        task_id = task.task_id
+        try:
+            capability_service = CapabilityService(db)
+            version = capability_service.get_published_version(
+                task.capability_name, task.capability_version
+            )
+        except CapabilityError as exc:
+            task.status = "FAILED"
+            task.finished_at = utcnow()
+            service._record(
+                task_id, "task.failed",
+                payload={"error_code": "CAPABILITY_UNAVAILABLE", "error_message": str(exc)[:500]},
+            )
+            db.commit()
+            logger.warning("capability task %s failed to resolve: %s", task_id, exc)
+            return False
+
+        try:
+            device_id = CapabilityResolver(db).resolve_worker(
+                task.capability_name, version.version, task.target_device_id
+            )
+        except CapabilityNoWorker:
+            # Transient: keep dispatchable, monitor sweeps retry within the
+            # offline max-wait window (same policy as legacy offline tasks).
+            task.status = "PENDING"
+            db.commit()
+            logger.info("capability task %s has no online worker yet; stays PENDING", task_id)
+            return False
+
+        # Device lock (PDF §81) applies to capability executions too.
+        busy = db.scalars(
+            select(Task.task_id).where(
+                Task.target_device_id == device_id,
+                Task.status.in_(LIVE_TASK_STATES),
+                Task.task_id != task_id,
+            )
+        ).first()
+        if busy is not None:
+            task.status = "PENDING"
+            db.commit()
+            logger.info("capability task %s deferred: worker %s busy with %s", task_id, device_id, busy)
+            return False
+
+        if not self.device_link.is_online(device_id):
+            task.status = "PENDING"
+            db.commit()
+            return False
+
+        package = PackageService(db).get_package(version.package_id)
+        timeout = settings.capability_default_timeout
+
+        attempt = TaskAttempt(
+            attempt_id=f"attempt_{new_message_id('a')[2:]}",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            device_id=device_id,
+            attempt_no=service.count_attempts(task_id, step.step_id) + 1,
+            status="DISPATCHING",
+        )
+        db.add(attempt)
+        step.current_attempt_id = attempt.attempt_id
+        # Persist the resolved worker on the task (§32 worker_id mapping).
+        task.target_device_id = device_id
+        service._record(task_id, "task.dispatching", step_id=step.step_id, attempt_id=attempt.attempt_id)
+        db.commit()
+
+        envelope = Envelope(
+            id=new_message_id(),
+            type=MessageType.CAPABILITY_EXECUTE,
+            data={
+                "task_id": task_id,
+                "step_id": step.step_id,
+                "attempt_id": attempt.attempt_id,
+                "execution_id": attempt.attempt_id,
+                "capability": task.capability_name,
+                "version": version.version,
+                "params": step.params,
+                "timeout": timeout,
+                "package_id": package.package_id,
+                "checksum": package.checksum,
+                "workflow_run_id": task.workflow_run_id,
+                "step_run_id": task.workflow_step_run_id,
+            },
+        )
+        sent = await self.device_link.send_task(device_id, envelope)
+        if sent == 0:
+            db.delete(attempt)
+            task.status = "PENDING"
+            step.current_attempt_id = None
+            service._record(task_id, "task.dispatch_failed", step_id=step.step_id, payload={"reason": "worker_offline"})
+            db.commit()
+            return False
+
+        attempt.status = "SENT"
+        attempt.dispatch_message_id = envelope.id
+        task.status = "SENT"
+        task.timeout_at = utcnow() + timedelta(seconds=timeout)
+        attempt.timeout_at = task.timeout_at
+        service._record(
+            task_id, "task.sent", step_id=step.step_id, attempt_id=attempt.attempt_id,
+            payload={
+                "message_id": envelope.id, "connections": sent,
+                "capability": task.capability_name, "capability_version": version.version,
+                "package_id": package.package_id,
+            },
+        )
+        db.commit()
+        logger.info(
+            "capability task %s step %s dispatched %s@%s -> worker %s (attempt %s)",
+            task_id, step.step_id, task.capability_name, version.version, device_id, attempt.attempt_no,
+        )
+        return True

@@ -19,6 +19,10 @@ class TaskCreateIn(BaseModel):
     source_type: str | None = Field(default=None, max_length=32)
     workflow_run_id: str | None = Field(default=None, max_length=64)
     workflow_step_run_id: str | None = Field(default=None, max_length=64)
+    # V1.4 §32/§73: LEGACY_COMMAND (default) | CAPABILITY
+    execution_type: str | None = Field(default=None, max_length=16)
+    # CAPABILITY tasks: pinned version (None = capability current_version)
+    capability_version: str | None = Field(default=None, max_length=32)
 
 
 class StepOut(BaseModel):

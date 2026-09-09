@@ -1,4 +1,4 @@
-﻿"""WorkflowEngine: deterministic orchestration (V1.3 §26-§30/§123).
+"""WorkflowEngine: deterministic orchestration (V1.3 §26-§30/§123).
 
 Owns: which step is next, when it is READY, what Task to create, when the
 run succeeds/fails/cancels. Never dispatches over WebSockets itself - the
@@ -22,7 +22,7 @@ from app.task import models as task_schemas
 from app.task.db_models import Task, TaskAttempt, TaskEvent
 from app.task.errors import InvalidTaskState, TaskError, TaskNotFound
 from app.task.service import TaskService
-from app.workflow.context import build_context, record_step_result
+from app.workflow.context import append_artifacts, build_context, record_step_result
 from app.workflow.db_models import Workflow, WorkflowEvent, WorkflowRun, WorkflowStep, WorkflowStepRun
 from app.workflow.errors import (
     InvalidWorkflowState,
@@ -127,6 +127,7 @@ class WorkflowEngine:
                     name=step.name,
                     order_no=order_no,
                     command=step.command,
+                    capability_version=step.capability_version,
                     status="READY" if order_no == 1 else "PENDING",
                 )
             )
@@ -233,13 +234,18 @@ class WorkflowEngine:
         except WorkflowParamResolutionFailed as exc:
             return self._fail_step(run, step_run, "WORKFLOW_PARAM_RESOLUTION_FAILED", str(exc))
 
-        # --- device: fixed, else pick an online device with the capability
-        device_id = step.device_id or self._pick_device(step.command)
-        if device_id is None:
-            return self._fail_step(
-                run, step_run, "WORKFLOW_TASK_CREATE_FAILED",
-                f"no online device reports capability: {step.command}",
-            )
+        # --- V1.4 §24: capability step - command doubles as the capability
+        # name. The worker is left to the CapabilityResolver at dispatch time
+        # (Lazy Pull §52); only a pinned device passes through.
+        is_capability = step.capability_version is not None
+        device_id = step.device_id
+        if not is_capability and device_id is None:
+            device_id = self._pick_device(step.command)
+            if device_id is None:
+                return self._fail_step(
+                    run, step_run, "WORKFLOW_TASK_CREATE_FAILED",
+                    f"no online device reports capability: {step.command}",
+                )
 
         # --- create the Task (Task Engine owns it from here, §30-§33)
         try:
@@ -251,15 +257,21 @@ class WorkflowEngine:
                     source_type="WORKFLOW",
                     workflow_run_id=run.run_id,
                     workflow_step_run_id=step_run.step_run_id,
+                    execution_type="CAPABILITY" if is_capability else None,
+                    capability_version=step_run.capability_version if is_capability else None,
                 ),
                 created_by=f"workflow:{run.run_id}",
             )
         except TaskError as exc:
             return self._fail_step(run, step_run, "WORKFLOW_TASK_CREATE_FAILED", str(exc))
 
+        # Snapshot the concrete pinned version (TaskService resolves it).
         self.db.query(WorkflowStepRun).filter(
             WorkflowStepRun.step_run_id == step_run.step_run_id
-        ).update({"task_id": task.task_id}, synchronize_session=False)
+        ).update(
+            {"task_id": task.task_id, "capability_version": task.capability_version},
+            synchronize_session=False,
+        )
         self.db.commit()
         logger.info(
             "workflow %s step %s created task %s (%s)",
@@ -347,6 +359,7 @@ class WorkflowEngine:
 
     def _complete_step(self, run: WorkflowRun, step_run: WorkflowStepRun, task_id: str) -> list[str]:
         result = self._final_result_payload(task_id)
+        artifacts = self._task_artifacts(task_id)
         updated = (
             self.db.query(WorkflowStepRun)
             .filter(WorkflowStepRun.step_run_id == step_run.step_run_id, WorkflowStepRun.status == "RUNNING")
@@ -358,15 +371,35 @@ class WorkflowEngine:
         self.db.commit()
         if not updated:
             return []  # lost a cancel race (§51): the cancel path owns the step
-        record_step_result(
-            self._reload_context(run.run_id), step_run.name, task_id, "SUCCESS", result
-        )
+        context = self._reload_context(run.run_id)
+        record_step_result(context, step_run.name, task_id, "SUCCESS", result)
+        # V1.4 §27: worker-uploaded artifacts join the run context (§28).
+        append_artifacts(context, step_run.name, artifacts)
         self._persist_context(run.run_id)
         self._record(run.run_id, "workflow.step_success", step_run.step_run_id,
                      {"step": step_run.name, "task_id": task_id})
         self.db.commit()
         run = self.get_run(run.run_id)
         return self.advance(run)
+
+    def _task_artifacts(self, task_id: str) -> list[dict]:
+        """Artifact index rows for a finished task (§27/§29)."""
+        from app.artifact.db_models import Artifact
+
+        rows = list(
+            self.db.scalars(
+                select(Artifact).where(Artifact.task_id == task_id).order_by(Artifact.id)
+            )
+        )
+        return [
+            {
+                "artifact_id": row.artifact_id,
+                "name": row.name,
+                "type": row.type,
+                "size": row.size,
+            }
+            for row in rows
+        ]
 
     def _reload_context(self, run_id: str) -> dict:
         run = self.get_run(run_id)

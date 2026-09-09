@@ -44,6 +44,9 @@ class WorkflowStep(Base):
     name: Mapped[str] = mapped_column(String(64))
     order_no: Mapped[int] = mapped_column(Integer, default=1)
     command: Mapped[str] = mapped_column(String(128))
+    # V1.4 §24: capability steps. command doubles as capability_name; params
+    # holds capability_params. Version pinned here resolves at dispatch.
+    capability_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     params: Mapped[dict] = mapped_column(JSON, default=dict)
     device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # stop | retry
@@ -87,6 +90,8 @@ class WorkflowStepRun(Base):
     name: Mapped[str] = mapped_column(String(64))
     order_no: Mapped[int] = mapped_column(Integer, default=1)
     command: Mapped[str] = mapped_column(String(128))
+    # V1.4 §24: snapshot of the capability version this step ran with
+    capability_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # PENDING/READY/RUNNING/SUCCESS/FAILED/CANCELLED/SKIPPED
     status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
@@ -139,3 +144,45 @@ def ensure_task_source_columns(engine) -> None:
                 conn.execute(text(stmt))
         except Exception:  # noqa: BLE001 - concurrent startup may race the ALTER
             pass
+
+
+def ensure_capability_columns(engine) -> None:
+    """V1.4 best-effort column ensure for existing production tables.
+
+    Mirrors ensure_task_source_columns: create_all covers fresh databases;
+    MySQL production needs the explicit ADD COLUMN. Idempotent."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+
+    def _existing(table: str) -> set[str]:
+        return {c["name"] for c in inspector.get_columns(table)} if table in tables else set()
+
+    if "tasks" in tables:
+        existing = _existing("tasks")
+        statements = []
+        if "execution_type" not in existing:
+            statements.append(
+                "ALTER TABLE tasks ADD COLUMN execution_type VARCHAR(16) NOT NULL DEFAULT 'LEGACY_COMMAND'"
+            )
+        if "capability_name" not in existing:
+            statements.append("ALTER TABLE tasks ADD COLUMN capability_name VARCHAR(128) NULL")
+        if "capability_version" not in existing:
+            statements.append("ALTER TABLE tasks ADD COLUMN capability_version VARCHAR(32) NULL")
+        if "artifact_ids" not in existing:
+            statements.append("ALTER TABLE tasks ADD COLUMN artifact_ids JSON NOT NULL")
+        for stmt in statements:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(stmt))
+            except Exception:  # noqa: BLE001 - concurrent startup may race the ALTER
+                pass
+
+    for table in ("workflow_steps", "workflow_step_runs"):
+        if table in tables and "capability_version" not in _existing(table):
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN capability_version VARCHAR(32) NULL"))
+            except Exception:  # noqa: BLE001
+                pass

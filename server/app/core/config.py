@@ -100,6 +100,16 @@ class Settings:
         # --- V1.3 Workflow Engine ---
         # Safety-net sweep interval (task-terminal observer does real-time work)
         self.workflow_monitor_interval = float(os.getenv("WORKFLOW_MONITOR_INTERVAL", "5"))
+        # --- V1.4 Capability Runtime ---
+        # Local object storage for capability packages + artifacts (§31: files
+        # live on disk, MySQL keeps metadata; swap for OSS/MinIO later).
+        self.storage_dir = Path(
+            os.getenv("STORAGE_DIR", str(Path(__file__).resolve().parents[2] / "storage"))
+        )
+        # Task timeout for CAPABILITY tasks (no Command row to inherit from).
+        self.capability_default_timeout = int(os.getenv("CAPABILITY_DEFAULT_TIMEOUT", "1800"))
+        # Worker-side package pull retry budget (§67: 最多重试 2 次).
+        self.capability_pull_max_retries = int(os.getenv("CAPABILITY_PULL_MAX_RETRIES", "2"))
 
 
 settings = Settings()

@@ -49,40 +49,63 @@ class PythonExecutor(Executor):
         await progress(5, f"starting {script.name}")
 
         argv = [sys.executable, str(script), "--params-json", json.dumps(params, ensure_ascii=False)]
-        try:
-            proc = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                cwd=str(SCRIPTS_DIR),
-            )
-        except OSError as exc:
-            raise ExecutionError("EXECUTOR_START_FAILED", str(exc)) from exc
+        # Output goes to temp files, not pipes: polling a piped child with
+        # repeated communicate(timeout=...) is broken on Windows (returns
+        # early with a stale returncode) and large output can deadlock the
+        # child on a full pipe buffer.
+        import tempfile
 
+        out_f = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        err_f = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
         try:
-            stdout, stderr = "", ""
-            while True:
-                if cancel.is_set():
-                    proc.terminate()
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    stdout=out_f,
+                    stderr=err_f,
+                    text=True,
+                    encoding="utf-8",
+                    cwd=str(SCRIPTS_DIR),
+                )
+            except OSError as exc:
+                raise ExecutionError("EXECUTOR_START_FAILED", str(exc)) from exc
+
+            def _wait_child() -> str:
+                # Runs in a worker thread: a synchronous wait loop on the
+                # event loop thread would starve cancel sources (WS reads,
+                # cancel tasks) and block heartbeats for the whole execution.
+                while True:
+                    if cancel.is_set():
+                        return "cancelled"
                     try:
-                        proc.wait(timeout=5)
+                        proc.wait(timeout=POLL_INTERVAL)
+                        return "exited"
                     except subprocess.TimeoutExpired:
-                        proc.kill()
-                    raise ExecutionError("EXECUTOR_CANCELLED", "cancelled by server")
-                try:
-                    stdout, stderr = proc.communicate(timeout=POLL_INTERVAL)
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
-        except ExecutionError:
-            raise
-        except Exception as exc:  # unexpected failure around the process
-            proc.kill()
-            raise ExecutionError("EXECUTOR_FAILED", str(exc)) from exc
+                        continue
 
-        await progress(90, "collecting result")
+            try:
+                verdict = await asyncio.to_thread(_wait_child)
+            except ExecutionError:
+                raise
+            except Exception as exc:  # unexpected failure around the process
+                proc.kill()
+                raise ExecutionError("EXECUTOR_FAILED", str(exc)) from exc
+            if verdict == "cancelled":
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise ExecutionError("EXECUTOR_CANCELLED", "cancelled by server")
+
+            await progress(90, "collecting result")
+            out_f.seek(0)
+            err_f.seek(0)
+            stdout, stderr = out_f.read(), err_f.read()
+        finally:
+            out_f.close()
+            err_f.close()
+
         if proc.returncode != 0:
             raise ExecutionError("EXECUTOR_FAILED", (stderr or stdout or "")[-800:] or f"exit {proc.returncode}")
 

@@ -25,5 +25,19 @@ def record_step_result(
     return context
 
 
+def append_artifacts(context: dict, step_name: str, artifacts: list[dict]) -> dict:
+    """V1.4 §27: run-level artifact index ({"artifact_id", "name", "type",
+    "size", "step"}) so later steps / the Agent reference products without
+    touching worker filesystems (§28)."""
+    if not artifacts:
+        return context
+    index = context.setdefault("artifacts", [])
+    for artifact in artifacts:
+        entry = dict(artifact)
+        entry.setdefault("step", step_name)
+        index.append(entry)
+    return context
+
+
 def step_entry(context: dict, step_name: str) -> dict[str, Any] | None:
     return context.get("steps", {}).get(step_name)

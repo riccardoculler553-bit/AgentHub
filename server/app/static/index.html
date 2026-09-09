@@ -424,7 +424,7 @@ async function refreshCommands() {
 async function refreshCapabilities() {
   const tbody = document.getElementById("capRows");
   try {
-    const groups = await api("/api/capabilities").then(r => r.json());
+    const groups = await api("/api/device-capabilities").then(r => r.json());
     if (!groups.length) {
       tbody.innerHTML = '<tr><td colspan="2" class="empty">设备尚未上报能力（Worker 连接后自动上报）</td></tr>';
       return;

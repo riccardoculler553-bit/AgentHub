@@ -177,10 +177,12 @@ def get_command(command_name: str, db: Session = Depends(get_db)):
 
 
 # --------------------------------------------------------------- capabilities
+# V1.4: /api/capabilities now serves the AUTOMATION capability registry
+# (app.api.capability). Device command capabilities moved here.
 
 
-@router.get("/capabilities", response_model=list[schemas.CapabilityOut])
-def get_all_capabilities(db: Session = Depends(get_db)):
+@router.get("/device-capabilities", response_model=list[schemas.CapabilityOut])
+def get_all_device_capabilities(db: Session = Depends(get_db)):
     return CapabilityService(db).get_all_grouped()
 
 

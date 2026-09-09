@@ -147,15 +147,37 @@ async def _dispatch(connection: DeviceConnection, envelope: Envelope) -> None:
         await connection.send(
             Envelope(id=envelope.id, type=MessageType.MESSAGE_ACK, data={"success": True, "stored": count})
         )
+    elif msg_type == MessageType.WORKER_CAPABILITIES:
+        # V1.4 §17/§63: installed automation capability packages
+        with SessionLocal() as db:
+            from app.capability_runtime.worker_registry import WorkerCapabilityService
+
+            count = WorkerCapabilityService(db).replace_worker_capabilities(
+                connection.device_id, envelope.data.get("capabilities", [])
+            )
+        logger.info("device %s reported %s automation capability package(s)", connection.device_id, count)
+        await connection.send(
+            Envelope(id=envelope.id, type=MessageType.MESSAGE_ACK, data={"success": True, "stored": count})
+        )
     elif msg_type in (
         MessageType.TASK_ACCEPT,
         MessageType.TASK_RUNNING,
         MessageType.TASK_PROGRESS,
         MessageType.TASK_RESULT,
+        # V1.4 §65: capability lifecycle rides the same Task state machine
+        MessageType.CAPABILITY_ACCEPT,
+        MessageType.CAPABILITY_RUNNING,
+        MessageType.CAPABILITY_PROGRESS,
+        MessageType.CAPABILITY_RESULT,
     ):
+        # Map capability.* onto the task lifecycle handlers so Retry/Timeout/
+        # Cancel/Recovery stay owned by the Task Engine (§67/§69/§70).
+        lifecycle_type = str(msg_type)
+        if lifecycle_type.startswith("capability."):
+            lifecycle_type = "task." + lifecycle_type.split(".", 1)[1]
         with SessionLocal() as db:
             result = TaskService(db).handle_device_event(
-                connection.device_id, str(msg_type), envelope.data
+                connection.device_id, lifecycle_type, envelope.data
             )
         await connection.send(
             Envelope(id=envelope.id, type=MessageType.MESSAGE_ACK, data={"success": True})

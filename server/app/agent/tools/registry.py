@@ -46,6 +46,7 @@ def build_default_registry(hub=None) -> ToolRegistry:
     so tests never leak tools into each other. `hub` gives online-status
     tools and dispatching tools access to live connection state.
     """
+    from app.agent.tools.capability import register_capability_tools
     from app.agent.tools.command import register_command_tools
     from app.agent.tools.device import register_device_tools
     from app.agent.tools.task import register_task_tools
@@ -56,4 +57,5 @@ def build_default_registry(hub=None) -> ToolRegistry:
     register_task_tools(registry, hub)
     register_command_tools(registry, hub)
     register_workflow_tools(registry, hub)
+    register_capability_tools(registry, hub)
     return registry

@@ -96,7 +96,7 @@ async def _call_policy(policy, name: str, args: dict, confirmed: bool = False):
 
 
 def test_default_registry_has_standard_tools(registry):
-    """V1.3: nine V1.2 tools + five workflow tools (14 total)."""
+    """V1.4: nine V1.2 tools + five workflow tools + three capability tools (17)."""
     expected = {
         "list_devices": ("READ", False),
         "get_device_status": ("READ", False),
@@ -113,6 +113,10 @@ def test_default_registry_has_standard_tools(registry):
         "get_workflow_run": ("READ", False),
         "run_workflow": ("ACTION", settings.agent_confirm_actions),
         "cancel_workflow_run": ("WRITE", True),
+        # V1.4 capability tools (§33)
+        "list_capabilities": ("READ", False),
+        "get_capability": ("READ", False),
+        "run_capability": ("ACTION", settings.agent_confirm_actions),
     }
     assert {t.name for t in registry.all()} == set(expected)
     for name, (risk, confirm) in expected.items():
@@ -123,6 +127,7 @@ def test_default_registry_has_standard_tools(registry):
     assert registry.get("retry_task").waits_task
     assert registry.get("execute_command").waits_task
     assert registry.get("run_workflow").waits_task
+    assert registry.get("run_capability").waits_task
 
 
 # --------------------------------------------------------------------- device

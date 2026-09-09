@@ -6,6 +6,12 @@ import uuid
 
 PROTOCOL_VERSION = 1
 
+# Message types the worker reacts to / reports (server protocol.py mirror).
+TASK_DISPATCH = "task.dispatch"
+TASK_CANCEL = "task.cancel"
+# V1.4 Capability Runtime (§65)
+CAPABILITY_EXECUTE = "capability.execute"
+
 
 class ProtocolError(ValueError):
     pass

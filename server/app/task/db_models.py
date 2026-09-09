@@ -29,6 +29,14 @@ class Task(Base):
     # V1.3 audit trail: reverse lookup Task -> WorkflowStepRun -> WorkflowRun (§31/§155)
     workflow_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     workflow_step_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # V1.4 §32/§73: LEGACY_COMMAND (V1.0-V1.3 commands) | CAPABILITY (Capability
+    # Runtime). Old tasks keep working unchanged; capability tasks carry the
+    # capability identity for the resolver and audit trail.
+    execution_type: Mapped[str] = mapped_column(String(16), default="LEGACY_COMMAND")
+    capability_name: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    capability_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # artifact ids produced by this task (uploaded via the Artifact plane, §45)
+    artifact_ids: Mapped[list] = mapped_column(JSON, default=list)
     priority: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
