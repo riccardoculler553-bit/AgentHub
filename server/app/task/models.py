@@ -11,6 +11,14 @@ class StepIn(BaseModel):
     params: dict = Field(default_factory=dict)
 
 
+class InputArtifactIn(BaseModel):
+    """V1.5 §15: a Task stores artifact REFERENCES, never local paths."""
+
+    artifact_id: str = Field(min_length=1, max_length=64)
+    # role = the manifest input name the artifact feeds (e.g. data_dir)
+    role: str = Field(default="input", max_length=128)
+
+
 class TaskCreateIn(BaseModel):
     name: str = Field(default="", max_length=200)
     target_device_id: str | None = Field(default=None, max_length=36)
@@ -23,6 +31,11 @@ class TaskCreateIn(BaseModel):
     execution_type: str | None = Field(default=None, max_length=16)
     # CAPABILITY tasks: pinned version (None = capability current_version)
     capability_version: str | None = Field(default=None, max_length=32)
+    # V1.5 §15: CAPABILITY task inputs (artifact references)
+    input_artifacts: list[InputArtifactIn] = Field(default_factory=list)
+    # V1.5: per-task timeout override in seconds (CAPABILITY tasks; None =
+    # CAPABILITY_DEFAULT_TIMEOUT). Big jobs set e.g. 7200.
+    timeout_seconds: int | None = Field(default=None, ge=60, le=86400)
 
 
 class StepOut(BaseModel):
@@ -45,6 +58,8 @@ class AttemptOut(BaseModel):
     error_message: str | None
     created_at: datetime
     finished_at: datetime | None
+    # Phase 8: latest monotonic progress snapshot (never stale/reordered)
+    progress: dict | None = None
 
 
 class EventOut(BaseModel):
@@ -64,6 +79,7 @@ class TaskOut(BaseModel):
     status: str
     priority: int
     max_attempts: int
+    timeout_seconds: int | None = None
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None

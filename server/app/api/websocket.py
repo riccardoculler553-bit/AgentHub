@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from app.auth.token import TokenService
 from app.capability.service import CapabilityService
+from app.core.background import spawn
 from app.core.exceptions import DeviceLinkError, DeviceRevoked, TokenInvalid
 from app.db.database import SessionLocal
 from app.db.models import Device, WebsocketConnection, utcnow
@@ -186,7 +187,7 @@ async def _dispatch(connection: DeviceConnection, envelope: Envelope) -> None:
             hub: ConnectionHub = connection.websocket.app.state.hub
             task_id = result["task_id"]
             logger.info("task %s advancing to next step", task_id)
-            asyncio.create_task(TaskDispatcher(hub).dispatch_task(task_id))
+            spawn(TaskDispatcher(hub).dispatch_task(task_id))
     elif msg_type == MessageType.TASK_CANCEL:
         # Server-initiated only; acknowledge and ignore device-side cancels.
         await connection.send(

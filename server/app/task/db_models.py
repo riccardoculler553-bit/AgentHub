@@ -39,7 +39,13 @@ class Task(Base):
     artifact_ids: Mapped[list] = mapped_column(JSON, default=list)
     priority: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    # V1.5: per-task timeout override (seconds); None = capability_default_timeout
+    timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Phase 2: when the task last entered PENDING (create/retry/rollback).
+    # The offline-max-wait watchdog uses this, NOT created_at - a retried old
+    # task must get a fresh dispatch window instead of timing out instantly.
+    pending_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -89,6 +95,11 @@ class TaskAttempt(Base):
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Phase 8: monotonic progress snapshot. progress_seq is the worker's
+    # per-attempt counter; an event with seq <= progress_seq never overwrites
+    # the snapshot, so the dashboard can never move backwards.
+    progress_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class TaskEvent(Base):

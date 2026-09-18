@@ -200,6 +200,7 @@ async def test_scenario_3_diagnose_failure(client, hub, registry, device):
 
 @pytest.mark.anyio
 async def test_scenario_4_auto_retry_with_confirmation(client, hub, registry, device):
+    """V1.5: retry_task 不再要求确认 —— 用户开口重试即直接执行。"""
     task_id = _create_echo_task(device["device_id"])
     _force_failed(task_id)  # retryable state without a worker
 
@@ -212,13 +213,11 @@ async def test_scenario_4_auto_retry_with_confirmation(client, hub, registry, de
             dec("tool_call", tool_name="retry_task", tool_args={"task_id": task_id}),
             dec("finish", answer="已重试成功。"),
         )
-        parked = await runner.run(f"把任务 {task_id} 再跑一次")
-        assert parked["paused"] is True  # WRITE -> confirmation (§56)
-        final = await runner.resume(parked, "是")
+        final = await runner.run(f"把任务 {task_id} 再跑一次")
     finally:
         worker.stop()
 
-    assert final["confirmed"] is True
+    assert final["paused"] is False  # no confirmation gate any more
     assert final["reply"] == "已重试成功。"
     assert _task(task_id).status == "SUCCESS"
 

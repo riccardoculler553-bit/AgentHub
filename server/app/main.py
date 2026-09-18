@@ -99,8 +99,12 @@ def create_app() -> FastAPI:
         # the same handle_message intake the DingTalk client calls.
         if settings.agent_mode == "tool_agent":
             from app.agent.service import AgentService
+            from app.agent.notify import install_agent_task_notifier
 
             app.state.agent_service = AgentService(app.state.hub, sender=DingTalkSender())
+            # Phase 3: task-terminal proactive DingTalk notification (fires
+            # only when the agent run already gave up waiting).
+            install_agent_task_notifier(DingTalkSender())
             logger.info("agent mode: tool_agent (V1.2 LangGraph tool-using agent)")
         else:
             app.state.agent_service = MvpAgentService(app.state.hub, sender=DingTalkSender())
@@ -136,6 +140,7 @@ def create_app() -> FastAPI:
     app.include_router(capability_api.router)
     app.include_router(capability_api.worker_router)
     app.include_router(artifact_api.upload_router)
+    app.include_router(artifact_api.download_router)
     app.include_router(artifact_api.admin_router)
 
     @app.get("/", include_in_schema=False)

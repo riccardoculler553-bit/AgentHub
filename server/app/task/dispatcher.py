@@ -82,6 +82,7 @@ class TaskDispatcher:
                 # Stay dispatchable: revert to PENDING, the monitor retries
                 # while the task is within its offline max wait.
                 task.status = "PENDING"
+                task.pending_since = utcnow()
                 db.commit()
                 return False
 
@@ -149,6 +150,7 @@ class TaskDispatcher:
                 # Race with disconnect: roll back to PENDING, monitor retries.
                 db.delete(attempt)
                 task.status = "PENDING"
+                task.pending_since = utcnow()
                 step.current_attempt_id = None
                 service._record(task_id, "task.dispatch_failed", step_id=step.step_id, payload={"reason": "device_offline"})
                 db.commit()
@@ -207,6 +209,7 @@ class TaskDispatcher:
             # Transient: keep dispatchable, monitor sweeps retry within the
             # offline max-wait window (same policy as legacy offline tasks).
             task.status = "PENDING"
+            task.pending_since = utcnow()
             db.commit()
             logger.info("capability task %s has no online worker yet; stays PENDING", task_id)
             return False
@@ -221,17 +224,53 @@ class TaskDispatcher:
         ).first()
         if busy is not None:
             task.status = "PENDING"
+            task.pending_since = utcnow()
             db.commit()
             logger.info("capability task %s deferred: worker %s busy with %s", task_id, device_id, busy)
             return False
 
         if not self.device_link.is_online(device_id):
             task.status = "PENDING"
+            task.pending_since = utcnow()
             db.commit()
             return False
 
         package = PackageService(db).get_package(version.package_id)
-        timeout = settings.capability_default_timeout
+        # V1.5: per-task timeout override; None falls back to the global default
+        timeout = task.timeout_seconds or settings.capability_default_timeout
+
+        # V1.5 §15/§26: resolve input artifact references into dispatch data.
+        # The Worker downloads over HTTP and verifies each checksum (§54); a
+        # missing artifact row is permanent -> fail the task here, not loop.
+        from app.artifact.service import ArtifactNotFound, ArtifactService
+
+        input_artifacts: list[dict] = []
+        for ref in task.artifact_ids or []:
+            if isinstance(ref, str):  # defensive: legacy plain-id entries
+                ref = {"artifact_id": ref, "role": "input"}
+            try:
+                artifact_row = ArtifactService(db).get_artifact(str(ref.get("artifact_id", "")))
+            except ArtifactNotFound:
+                task.status = "FAILED"
+                task.finished_at = utcnow()
+                service._record(
+                    task_id, "task.failed",
+                    payload={
+                        "error_code": "ARTIFACT_NOT_FOUND",
+                        "error_message": f"input artifact missing: {ref}",
+                    },
+                )
+                db.commit()
+                logger.warning("capability task %s failed: input artifact missing", task_id)
+                return False
+            input_artifacts.append(
+                {
+                    "artifact_id": str(ref.get("artifact_id", "")),
+                    "name": artifact_row.name,
+                    "checksum": artifact_row.checksum,
+                    "role": str(ref.get("role") or "input"),
+                }
+            )
 
         attempt = TaskAttempt(
             attempt_id=f"attempt_{new_message_id('a')[2:]}",
@@ -262,6 +301,7 @@ class TaskDispatcher:
                 "timeout": timeout,
                 "package_id": package.package_id,
                 "checksum": package.checksum,
+                "input_artifacts": input_artifacts,
                 "workflow_run_id": task.workflow_run_id,
                 "step_run_id": task.workflow_step_run_id,
             },
@@ -270,6 +310,7 @@ class TaskDispatcher:
         if sent == 0:
             db.delete(attempt)
             task.status = "PENDING"
+            task.pending_since = utcnow()
             step.current_attempt_id = None
             service._record(task_id, "task.dispatch_failed", step_id=step.step_id, payload={"reason": "worker_offline"})
             db.commit()

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.auth.admin import require_admin
 from app.capability.service import CapabilityService
 from app.command.service import CommandError, CommandService
+from app.core.background import spawn
 from app.core.exceptions import DeviceLinkError
 from app.db.database import get_db
 from app.task import models as schemas
@@ -40,6 +41,7 @@ def _task_detail(db: Session, task_id: str) -> schemas.TaskDetailOut:
         status=task.status,
         priority=task.priority,
         max_attempts=task.max_attempts,
+        timeout_seconds=task.timeout_seconds,
         created_at=task.created_at,
         started_at=task.started_at,
         finished_at=task.finished_at,
@@ -56,6 +58,7 @@ def _task_detail(db: Session, task_id: str) -> schemas.TaskDetailOut:
                 attempt_id=a.attempt_id, step_id=a.step_id, device_id=a.device_id,
                 attempt_no=a.attempt_no, status=a.status, error_code=a.error_code,
                 error_message=a.error_message, created_at=a.created_at, finished_at=a.finished_at,
+                progress=a.progress_json,
             )
             for a in service.get_attempts(task_id)
         ],
@@ -80,7 +83,7 @@ async def create_task(payload: schemas.TaskCreateIn, request: Request, db: Sessi
     except TaskError as exc:
         raise _task_error(exc) from exc
     dispatcher = TaskDispatcher(request.app.state.hub)
-    asyncio.create_task(dispatcher.dispatch_task(task.task_id))
+    spawn(dispatcher.dispatch_task(task.task_id))
     return _task_detail(db, task.task_id)
 
 
@@ -96,7 +99,8 @@ def list_tasks(
     return [
         schemas.TaskOut(
             task_id=t.task_id, name=t.name, target_device_id=t.target_device_id, status=t.status,
-            priority=t.priority, max_attempts=t.max_attempts, created_at=t.created_at,
+            priority=t.priority, max_attempts=t.max_attempts, timeout_seconds=t.timeout_seconds,
+            created_at=t.created_at,
             started_at=t.started_at, finished_at=t.finished_at, timeout_at=t.timeout_at,
         )
         for t in tasks
@@ -133,7 +137,7 @@ async def cancel_task(task_id: str, request: Request, db: Session = Depends(get_
         raise _task_error(exc) from exc
     if result["notify_device"]:
         monitor = TaskMonitor(request.app.state.hub)
-        asyncio.create_task(monitor.notify_cancel(result["task_id"]))
+        spawn(monitor.notify_cancel(result["task_id"]))
     return _task_detail(db, task_id)
 
 
@@ -144,7 +148,7 @@ async def retry_task(task_id: str, request: Request, db: Session = Depends(get_d
     except TaskError as exc:
         raise _task_error(exc) from exc
     dispatcher = TaskDispatcher(request.app.state.hub)
-    asyncio.create_task(dispatcher.dispatch_task(task_id))
+    spawn(dispatcher.dispatch_task(task_id))
     return _task_detail(db, task_id)
 
 

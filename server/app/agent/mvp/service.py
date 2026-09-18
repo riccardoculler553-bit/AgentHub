@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.agent.mvp.graph import build_mvp_graph
 from app.agent.runs import AgentRunService
+from app.core.background import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ class MvpAgentService:
                 reply_webhook=reply_webhook,
             )
             run_id = run.run_id
-        asyncio.create_task(self._process(run_id))
+        spawn(self._process(run_id))
         return run_id
 
     # ---------------------------------------------------------------- pipeline

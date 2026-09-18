@@ -91,6 +91,7 @@
   <button data-tab="tasks" onclick="showTab('tasks')">任务</button>
   <button data-tab="commands" onclick="showTab('commands')">命令</button>
   <button data-tab="capabilities" onclick="showTab('capabilities')">能力</button>
+  <button data-tab="artifacts" onclick="showTab('artifacts')">数据源</button>
   <button data-tab="agent" onclick="showTab('agent')">Agent</button>
 </nav>
 
@@ -160,6 +161,31 @@
   <div id="agentOut" class="agent-out"></div>
 </section>
 
+<!-- ============================== 数据源（Artifact） ============================== -->
+<section id="tab-artifacts" style="display:none">
+  <div class="toolbar">
+    <input type="text" id="artScanDir" placeholder="服务器本地目录，如 D:\数据\源数据" style="min-width:320px">
+    <button onclick="scanDir()">扫描目录</button>
+    <button class="ghost" onclick="uploadChecked()">上传选中 → 注册 Artifact</button>
+    <span id="artScanSpin" class="muted" style="display:none">处理中…</span>
+  </div>
+  <table>
+    <thead><tr><th style="width:36px"><input type="checkbox" id="artCheckAll" onchange="toggleAll(this)"></th>
+      <th>文件</th><th>大小</th><th>Artifact ID</th><th>操作</th></tr></thead>
+    <tbody id="artScanRows"><tr><td colspan="5" class="empty">输入服务器本地目录后扫描；勾选文件上传注册为 Artifact</td></tr></tbody>
+  </table>
+
+  <div class="section-title">已注册 Artifact（最近 50 条）</div>
+  <div class="toolbar">
+    <button class="ghost" onclick="refreshArtifacts()">刷新</button>
+    <span class="muted">派发任务时把 Artifact ID 填入 inputs（role = 能力 manifest 的输入名）</span>
+  </div>
+  <table>
+    <thead><tr><th>Artifact ID</th><th>名称</th><th>大小</th><th>来源任务</th><th>注册时间</th><th>操作</th></tr></thead>
+    <tbody id="artRows"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+  </table>
+</section>
+
 <!-- ============================== 任务详情弹窗 ============================== -->
 <div class="modal-mask" id="taskModal">
   <div class="modal">
@@ -215,6 +241,7 @@ function showTab(name) {
   if (name === "tasks") refreshTasks();
   if (name === "commands") refreshCommands();
   if (name === "capabilities") refreshCapabilities();
+  if (name === "artifacts") refreshArtifacts();
 }
 function refreshAll() {
   refreshDevices();
@@ -476,6 +503,136 @@ async function runAgent() {
     if (btn) btn.disabled = false;
     spin.style.display = "none";
   }
+}
+
+/* ============================== 数据源（Artifact） ============================== */
+function fmtSize(n) {
+  if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " GB";
+  if (n >= 1048576) return (n / 1048576).toFixed(2) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return n + " B";
+}
+let scannedFiles = [];   /* [{name, size}] from the last directory scan */
+
+async function scanDir() {
+  const dir = document.getElementById("artScanDir").value.trim();
+  const tbody = document.getElementById("artScanRows");
+  if (!dir) { alert("请输入服务器本地目录"); return; }
+  const spin = document.getElementById("artScanSpin");
+  spin.style.display = "";
+  try {
+    const res = await api(`/api/artifacts/scan?dir=${encodeURIComponent(dir)}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      tbody.innerHTML = `<tr><td colspan="5" class="empty">扫描失败：${esc(body.detail?.message || res.status)}</td></tr>`;
+      return;
+    }
+    const data = await res.json();
+    scannedFiles = data.files;
+    if (!scannedFiles.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">目录中没有可上传的文件（忽略隐藏/Excel 锁文件）</td></tr>';
+      return;
+    }
+    tbody.innerHTML = scannedFiles.map((f, i) => `
+      <tr>
+        <td><input type="checkbox" class="art-check" data-idx="${i}" checked></td>
+        <td>${esc(f.name)}</td>
+        <td class="mono">${fmtSize(f.size)}</td>
+        <td class="mono muted" id="artid-${i}">-</td>
+        <td class="actions" id="artact-${i}"></td>
+      </tr>`).join("");
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">${esc(e.message)}</td></tr>`;
+  } finally {
+    spin.style.display = "none";
+  }
+}
+
+function toggleAll(box) {
+  document.querySelectorAll(".art-check").forEach(c => { c.checked = box.checked; });
+}
+
+async function uploadChecked() {
+  const dir = document.getElementById("artScanDir").value.trim();
+  const idxs = [...document.querySelectorAll(".art-check:checked")].map(c => Number(c.dataset.idx));
+  if (!dir || !idxs.length) { alert("先扫描目录并勾选文件"); return; }
+  const spin = document.getElementById("artScanSpin");
+  spin.style.display = "";
+  try {
+    for (const i of idxs) {
+      const f = scannedFiles[i];
+      document.getElementById(`artid-${i}`).textContent = "注册中…";
+      try {
+        /* 服务器直接读本地文件登记（不经浏览器中转，大文件秒注册） */
+        const body = await registerServerFile(dir, f.name);
+        document.getElementById(`artid-${i}`).textContent = body.artifact_id;
+        document.getElementById(`artact-${i}`).innerHTML =
+          `<button class="ghost" onclick="copyArt('${body.artifact_id}')">复制</button>`;
+      } catch (e) {
+        document.getElementById(`artid-${i}`).textContent = "失败";
+        document.getElementById(`artact-${i}`).innerHTML = `<span class="muted">${esc(e.message)}</span>`;
+      }
+    }
+    refreshArtifacts();
+  } finally {
+    spin.style.display = "none";
+  }
+}
+
+async function registerServerFile(dir, name) {
+  const res = await api("/api/artifacts/register-local", {
+    method: "POST", body: JSON.stringify({ dir, name }),
+  });
+  if (res.status === 401) { setAdminState(false); throw new Error("需要有效的 Admin Token"); }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail?.message || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+function copyArt(id) {
+  navigator.clipboard.writeText(id).then(
+    () => {}, () => { prompt("手动复制：", id); }
+  );
+}
+
+async function refreshArtifacts() {
+  const tbody = document.getElementById("artRows");
+  try {
+    const rows = await api("/api/artifacts?limit=50").then(r => r.json());
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">还没有 Artifact，先扫描目录上传</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(a => `
+      <tr>
+        <td class="mono">${esc(a.artifact_id)}</td>
+        <td>${esc(a.name)}</td>
+        <td class="mono">${fmtSize(a.size)}</td>
+        <td class="mono muted">${esc(a.task_id || "-")}</td>
+        <td>${fmtAbs(a.created_at)}</td>
+        <td class="actions">
+          <button class="ghost" onclick="copyArt('${a.artifact_id}')">复制ID</button>
+          <button class="ghost" onclick="downloadArt('${a.artifact_id}','${esc(a.name)}')">下载</button>
+        </td>
+      </tr>`).join("");
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">${esc(e.message)}</td></tr>`;
+  }
+}
+
+async function downloadArt(id, name) {
+  try {
+    const res = await fetch(`/api/artifacts/${id}/download`, { headers: authHeaders() });
+    if (!res.ok) { alert("下载失败: HTTP " + res.status); return; }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name || id;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) { alert(e.message); }
 }
 
 document.getElementById("adminToken").value = adminToken;

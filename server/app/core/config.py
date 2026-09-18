@@ -108,6 +108,10 @@ class Settings:
         )
         # Task timeout for CAPABILITY tasks (no Command row to inherit from).
         self.capability_default_timeout = int(os.getenv("CAPABILITY_DEFAULT_TIMEOUT", "1800"))
+        # Phase 2: how long (seconds) the monitor keeps re-delivering stop
+        # instructions for a terminal task whose attempt is still live before
+        # closing that attempt STALE.
+        self.task_cancel_resend_window = int(os.getenv("TASK_CANCEL_RESEND_WINDOW", "600"))
         # Worker-side package pull retry budget (§67: 最多重试 2 次).
         self.capability_pull_max_retries = int(os.getenv("CAPABILITY_PULL_MAX_RETRIES", "2"))
 

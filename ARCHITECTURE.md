@@ -1,8 +1,8 @@
-# AgentHub 开发架构文档（当前实现快照 · V1.3 Workflow-1.0）
+# AgentHub 开发架构文档（当前实现快照 · V1.5 Remote-Exec-1.0）
 
-> 版本：AgentHub V1.3 Workflow Engine + V1.2 Tool-Using Agent + V1.1 Reliable-1.0 + MVP-Real-1.0 + Routing-1.0（底层 DeviceLink V1.0 已含 2026-09-05 公网架构调整）· 更新日期：2026-09-08
-> 测试基线：`pytest tests/` → **232 passed**（unit / integration / agenthub 验收 / MVP / 影刀执行器 / 路由 / V1.1 可靠性矩阵 / 状态机 / V1.2 契约·策略·循环·确认·恢复·审计·10 场景验收 / **V1.3 Workflow 状态机·解析器·注册表·10 场景验收**）
-> 里程碑：**MVP 已全链路实机跑通**（§16）；**V1.1 可靠性执行落地**（§17）；**V1.2 Tool-Using Agent 落地**（LangGraph 工具循环 + 七闸门策略 + 确认/恢复 + 调用审计，`AGENT_MODE=tool_agent` 可切换，见 §18）；**V1.3 Workflow Engine 落地**（确定性多步编排：定义/运行/上下文传参/重试/取消/单例/重启恢复，见 §19）。
+> 版本：AgentHub V1.5 Remote-Exec-1.0 + V1.3 Workflow Engine + V1.2 Tool-Using Agent + V1.1 Reliable-1.0 + MVP-Real-1.0 + Routing-1.0（底层 DeviceLink V1.0 已含 2026-09-05 公网架构调整）· 更新日期：2026-09-12
+> 测试基线：`pytest tests/`（排除已知挂起的 test_capability_acceptance.py，技术债）→ **299 passed**
+> 里程碑：**MVP 已全链路实机跑通**（§16）；**V1.1 可靠性执行落地**（§17）；**V1.2 Tool-Using Agent 落地**（§18）；**V1.3 Workflow Engine 落地**（§19）；**V1.4 Capability Runtime + V1.5 远程执行落地**（能力包/Artifact 数据平面/输入链路/Python venv Runtime/Workspace，首个真实能力 data.excel.preprocess 实机验收通过，见 §20）。
 
 AgentHub 是构建在 DeviceLink（多设备 WebSocket 注册与连接管理平台）之上的**任务控制与智能编排层**：Admin/主 Agent 把自然语言或结构化请求转化为任务（Task），经命令注册表（Command Registry）与能力注册表（Capability Registry）双重校验后，通过 DeviceLink 长连接派发到指定子电脑的 Worker 执行，回报结果、支持多步串行、自动重试、超时看门狗、取消与离线重派。
 
@@ -812,67 +812,6 @@ START → understand      目标重述（恢复 Run 时叠加用户补充）
       └→ llm_decide（循环） … → finish → build_reply → END
 ```
 
-- **决策只有三个动作**；`ask_user` 是一等公民结果而非错误（error=None，§47）。
-- **LLM 永不轮询**：execute/retry/cancel 工具内部 `_wait_terminal` 等待终态（task_waiters 进程内事件即时唤醒 + DB 轮询兜底，上限 `AGENT_TOOL_WAIT_MAX`），返回带终态状态的 ToolResult。
-- **观察即上下文**：observations 列表随状态跨停靠持久化，resume 后 LLM 仍看得见之前的工具事实。
-- **运行时护栏**：evaluate 用单调时钟检查 `AGENT_MAX_RUNTIME`；超限置 AGENT_TIMEOUT 强制 finish（不依赖 LLM 自觉）。
-
-### 18.4 风险控制：确认、恢复与注入防篡改
-
-| 机制 | 实现 |
-| --- | --- |
-| 七闸门准入 | 存在 → enabled → args 严格校验（extra=forbid）→ 权限 → 确认 → 每工具/全局限额 → 执行；任何闸门拒绝 = 带 error_code 的观察 |
-| 确认停靠 | requires_confirmation 工具未带 confirmed → `CONFIRMATION_REQUIRED`（data 携带 pending_args）→ ask_user 节点停靠 → AgentRun 置 `WAITING_USER`，序列化 AgentState 落 `state_json` |
-| 恢复执行 | 用户回复 → resume()：反序列化状态 + 叠加补充 + 重建 ToolPolicy（`used_total` 续算全局预算）→ 重进图 |
-| **确认防注入** | 肯定答复（是/确认/ok…）→ **跳过 LLM**，以 `confirmed=True` 直执行停靠参数（路由短路）；LLM 全程不再被咨询 —— 被提示注入的模型无法改参数（§57）。否定答复 → 取消该调用，作为观察回主循环 |
-| 多轮入口 | 钉钉/`POST /api/agent/message`：同会话存在 WAITING_USER Run → 新消息自动恢复；API 也可显式 `POST /runs/{id}/message` |
-| Run 取消 | `POST /runs/{id}/cancel` 只关 Run；**业务任务不自动取消**（用户须显式 cancel_task —— Run ≠ Task 边界，§90） |
-
-已知限制（记录在 §15）：恢复时每工具账本重启（全局预算连续，state.tool_call_count 保持一致）。
-
-### 18.5 服务层语义（AgentService）
-
-- `handle_message`：message_id 幂等（Stream 重放/重试返回既有 run_id）→ 会话内可恢复 Run 优先 → 否则新建 Run 后台图执行（HTTP/WS 零阻塞）。
-- `resume_run`：状态校验（非 WAITING_USER → 409）→ `reopen` WAITING_USER→RUNNING（原子：竞争恢复者失败）→ 图续跑 → `_finalize` 落终态（或再次停靠）。
-- `tool_call_count` 随 finish 落库；`GET /api/agent/runs/{id}` 全量可观测（状态/最终回复/工具调用数）。
-
-### 18.6 审计（agent_tool_calls，迁移 0005）
-
-- **ToolPolicy 是唯一写入方**（工具 handler 永不触碰）：准入即 RUNNING，返回落 SUCCESS/FAILED，准入拒绝落 REJECTED。
-- 大载荷写入时截断（存摘要不存巨 blob）；`run_id` 索引；Run 行 `tool_call_count` 为权威计数。
-- 排障路径：run_id → agent_tool_calls 全序列（参数/结果/错误码/时延）+ task_events 业务侧事件，双侧对账。
-
-### 18.7 AGENT_MODE 开关与装配（main.py）
-
-```
-AGENT_MODE=mvp        → MvpAgentService（§16 固定管线，默认，生产行为不变）
-AGENT_MODE=tool_agent → AgentService（§18 Tool-Using Agent）
-```
-
-- 装配点唯一（main.py 启动时按模式二选一），钉钉消息与 `/api/agent/message` 共用装配；回滚 = 改环境变量重启。
-- 两模式共享：AgentRun 表 / Dashboard / TaskService / DeviceLink / 钉钉 Stream 网关。
-
-### 18.8 验收矩阵（tests/agenthub/test_acceptance_v12.py —— 10 场景全过，LLM 脚本化、工具零 mock）
-
-| # | 场景 | 验证点 |
-| --- | --- | --- |
-| 1 | 运行命令 | execute_command → 真实 Task SUCCESS（FakeWorker 全链路），回复事实正确 |
-| 2 | 查询结果 | get_task_detail 观察含 SUCCESS，tool_call_count=1 |
-| 3 | 诊断失败 | 失败原因（EXECUTOR_FAILED/boom）进入回复 |
-| 4 | Retry 确认 | WRITE 确认停靠 → 肯定答复恢复执行 → 任务 SUCCESS |
-| 5 | 取消执行中任务 | SENT（派发后未接受）确认后 CANCELLED |
-| 6 | 设备不存在 | DEVICE_NOT_FOUND 观察 → ask_user 停靠；**不创建必败任务** |
-| 7 | 设备离线 Replan | 任务排队 PENDING + 查实时状态 + 事实性回复（不撒谎） |
-| 8 | 迟到事件 | CANCELLED 后迟到 SUCCESS → `task.late_result` 审计，任务不复活 |
-| 9 | 重复调用 | 每工具 max_calls=2 → 第 3 次 `MAX_CALLS_EXCEEDED` 观察，LLM 体面收尾 |
-| 10 | 危险调用拒绝 | script_path 参数走私 → `INVALID_ARGS`；未注册命令 → `COMMAND_NOT_FOUND`；零任务产生 |
-
-### 18.9 V1.2 里程碑记录（2026-09-08）
-
-- 迁移 0005：`agent_tool_calls` 表 + `agent_runs` 扩列（state_json/tool_call_count）， downgrade 完整。
-- 全量回归基线：**193 passed**（unit 契约/循环/确认/恢复/审计/服务 + agenthub 工具集成/Run API/10 场景验收）。
-- `AGENT_MODE=tool_agent` 生产切换待实机验证（当前生产继续跑 mvp 模式，行为零变化）。
-
 ## 19. V1.3 Workflow Engine（Workflow-1.0）
 
 > 里程碑：V1.3 在 V1.1 任务引擎与 V1.2 Tool-Using Agent 之上，落地**确定性多步业务编排**。LLM 只决定"跑哪个流程、填什么变量"（§18 Agent），步骤推进/传参/重试/取消/恢复全部由状态机完成 —— **编排链路零 LLM 参与**（§205）。`AGENT_MODE=mvp` 生产默认行为不变。
@@ -993,3 +932,124 @@ Agent 只传 `workflow` 名 + `version`（可选）+ `variables` —— **步骤
 - 新增 12 个 workflow 模块文件 + 5 张表 + `tasks` 溯源扩列 + 任务终态观察者（task/events.py）+ 10 个 Admin 端点 + 5 个 Agent 工具（目录 9 → 14）。
 - 全量回归基线：**232 passed**（V1.2 基线 193 + workflow unit 29 + agenthub 集成 10）。
 - 生产影响：零。`AGENT_MODE=mvp` 默认管线不变；Workflow 功能随迁移与启动钩子就位，创建/启用定义后才产生行为。
+
+## 20. V1.4+V1.5 Capability Runtime 与远程执行（Capability-1.0 → Remote-Exec-1.0）
+
+> 里程碑：V1.4 落地能力注册表三表（capabilities/capability_versions/capability_packages）+
+> 包上传/发布/下载 API + Worker 侧 Lazy Pull（CapabilityManager/Cache/Puller，SHA256 校验）+
+> Artifact 平面（上传/去重）。V1.5 在此之上打通**「程序包 + 数据源 → 指定 Worker 执行 → 产物回传」**
+> 的完整真实链路，首个真实能力 `data.excel.preprocess`（Polars Excel 预处理）实机验证通过。
+
+### 20.1 四元模型（V1.5 铁律）
+
+```
+Capability = 程序（包）      Artifact = 数据
+Task       = 一次执行        Worker    = 执行地点
+```
+
+- WebSocket 只传控制与引用（task/capability.execute、input_artifacts 引用列表）；大文件一律走 HTTP 数据平面。
+- Task 只保存 Artifact **引用**（`tasks.artifact_ids` JSON：`[{"artifact_id","role"}]`），永不保存本地路径。
+- 业务 Capability 保持纯 CLI（`--input/--mapping/--output`），不 import 任何 AgentHub SDK；双模式同代码（本地 CLI / AgentHub env 注入）。
+
+### 20.2 输入 Artifact 链路（§13/§15/§16/§26）
+
+```
+run_capability(capability, version?, device?, inputs{manifest输入名: [artifact_id]}, params?)
+  → TaskService.create（校验引用存在）→ task.artifact_ids=[{artifact_id, role}]
+  → Dispatcher._dispatch_capability：查 Artifact 表补 name/checksum
+      capability.execute payload += input_artifacts:[{artifact_id, name, checksum, role}]
+  → Worker TaskManager._prepare_inputs（validate 之前）：
+      ArtifactDownloader.download（Bearer 设备令牌 + SHA256 校验 + <work>/artifact_cache/<checksum> 缓存）
+      → 复制到 <exec>/<role 或 manifest.path>/ → params[<manifest输入名>] = 目录路径
+  → PythonExecutor 注入 outputs（params[output_dir]=<exec>/output，自动建目录）
+  → 执行 → result.json artifacts 或 output/ 扫描 → ArtifactUploader 上传 → task.result 只带 artifact 引用
+```
+
+- `GET /api/artifacts/{id}/download`：设备 Bearer 或 admin（V1.4 起仅 admin；V1.5 开放设备令牌，并修复 storage_path 相对 artifacts_root 的路径 bug）。
+- 错误码（§33）：`ARTIFACT_NOT_FOUND`（创建时引用校验/派发时行缺失）、`ARTIFACT_DOWNLOAD_FAILED`、`ARTIFACT_CHECKSUM_MISMATCH`（不重试）、`PYTHON_ENV_CREATE_FAILED`、`DEPENDENCY_INSTALL_FAILED`。
+
+### 20.3 Python Runtime（§29/§30/§34/§35）
+
+- 包内 `requirements.txt` 存在时：`<work>/envs/<name>/<version>` 建 venv + `pip install -r requirements.txt`（cancel-aware 轮询等待，tempfile 输出防 Windows 管道死锁）；`.deps_ok` 标记存 requirements 哈希，命中即复用（无网络）。无 requirements 用 `sys.executable`。
+- 业务成功判据 = exit 0 **且** 产物存在（result.json artifacts 或声明输出目录扫描），失败无产物 → FAILED。
+
+### 20.4 Workspace（§17/§42）
+
+```
+<work>/executions/<attempt_id>/     # execution_id == attempt_id，天然任务隔离
+├── input/    mapping/             # 输入 Artifact 落地（role 或 manifest.inputs[].path）
+├── output/                        # 产物目录（manifest.outputs[].path，默认 output）
+├── context.json  params.json      # 执行上下文留痕
+<work>/capabilities/<name>/<version>/   # 包缓存（checksum 标记复用）
+<work>/envs/<name>/<version>/           # venv 依赖缓存（.deps_ok）
+<work>/artifact_cache/<checksum>/       # 数据缓存（§31 最简版，无 LRU）
+```
+
+### 20.5 首个真实能力：data.excel.preprocess
+
+- 源：`D:\Slaes - 副本\preprocess_tool`（capability/ 程序本体 + sandbox/ 数据沙箱 + dist/ 构建产物；`build.py` 打包，sandbox 永不进包）。
+- manifest：runtime=python，entrypoint=main，inputs=`data_dir`(path=input, required)/`mapping_dir`(path=mapping, required)，outputs=`output_dir`(path=output)。名称遵守 V1.4 三段式规范。
+- E2E 验收（scripts/e2e_v15.py，单机 server+worker）：发布 1.0.0 → 上传 1 数据 + 4 映射 Artifact → 指定设备建 Task → Worker 拉包/建 venv/装依赖/下载输入/执行 Polars 流水线 → 产物回传下载校验（列增删正确）。二跑 3s（venv/包/数据三缓存全命中）。
+
+
+- **决策只有三个动作**；`ask_user` 是一等公民结果而非错误（error=None，§47）。
+- **LLM 永不轮询**：execute/retry/cancel 工具内部 `_wait_terminal` 等待终态（task_waiters 进程内事件即时唤醒 + DB 轮询兜底，上限 `AGENT_TOOL_WAIT_MAX`），返回带终态状态的 ToolResult。
+- **观察即上下文**：observations 列表随状态跨停靠持久化，resume 后 LLM 仍看得见之前的工具事实。
+- **运行时护栏**：evaluate 用单调时钟检查 `AGENT_MAX_RUNTIME`；超限置 AGENT_TIMEOUT 强制 finish（不依赖 LLM 自觉）。
+
+### 18.4 风险控制：确认、恢复与注入防篡改
+
+| 机制 | 实现 |
+| --- | --- |
+| 七闸门准入 | 存在 → enabled → args 严格校验（extra=forbid）→ 权限 → 确认 → 每工具/全局限额 → 执行；任何闸门拒绝 = 带 error_code 的观察 |
+| 确认停靠 | requires_confirmation 工具未带 confirmed → `CONFIRMATION_REQUIRED`（data 携带 pending_args）→ ask_user 节点停靠 → AgentRun 置 `WAITING_USER`，序列化 AgentState 落 `state_json` |
+| 恢复执行 | 用户回复 → resume()：反序列化状态 + 叠加补充 + 重建 ToolPolicy（`used_total` 续算全局预算）→ 重进图 |
+| **确认防注入** | 肯定答复（是/确认/ok…）→ **跳过 LLM**，以 `confirmed=True` 直执行停靠参数（路由短路）；LLM 全程不再被咨询 —— 被提示注入的模型无法改参数（§57）。否定答复 → 取消该调用，作为观察回主循环 |
+| 多轮入口 | 钉钉/`POST /api/agent/message`：同会话存在 WAITING_USER Run → 新消息自动恢复；API 也可显式 `POST /runs/{id}/message` |
+| Run 取消 | `POST /runs/{id}/cancel` 只关 Run；**业务任务不自动取消**（用户须显式 cancel_task —— Run ≠ Task 边界，§90） |
+
+已知限制（记录在 §15）：恢复时每工具账本重启（全局预算连续，state.tool_call_count 保持一致）。
+
+### 18.5 服务层语义（AgentService）
+
+- `handle_message`：message_id 幂等（Stream 重放/重试返回既有 run_id）→ 会话内可恢复 Run 优先 → 否则新建 Run 后台图执行（HTTP/WS 零阻塞）。
+- `resume_run`：状态校验（非 WAITING_USER → 409）→ `reopen` WAITING_USER→RUNNING（原子：竞争恢复者失败）→ 图续跑 → `_finalize` 落终态（或再次停靠）。
+- `tool_call_count` 随 finish 落库；`GET /api/agent/runs/{id}` 全量可观测（状态/最终回复/工具调用数）。
+
+### 18.6 审计（agent_tool_calls，迁移 0005）
+
+- **ToolPolicy 是唯一写入方**（工具 handler 永不触碰）：准入即 RUNNING，返回落 SUCCESS/FAILED，准入拒绝落 REJECTED。
+- 大载荷写入时截断（存摘要不存巨 blob）；`run_id` 索引；Run 行 `tool_call_count` 为权威计数。
+- 排障路径：run_id → agent_tool_calls 全序列（参数/结果/错误码/时延）+ task_events 业务侧事件，双侧对账。
+
+### 18.7 AGENT_MODE 开关与装配（main.py）
+
+```
+AGENT_MODE=mvp        → MvpAgentService（§16 固定管线，默认，生产行为不变）
+AGENT_MODE=tool_agent → AgentService（§18 Tool-Using Agent）
+```
+
+- 装配点唯一（main.py 启动时按模式二选一），钉钉消息与 `/api/agent/message` 共用装配；回滚 = 改环境变量重启。
+- 两模式共享：AgentRun 表 / Dashboard / TaskService / DeviceLink / 钉钉 Stream 网关。
+
+### 18.8 验收矩阵（tests/agenthub/test_acceptance_v12.py —— 10 场景全过，LLM 脚本化、工具零 mock）
+
+| # | 场景 | 验证点 |
+| --- | --- | --- |
+| 1 | 运行命令 | execute_command → 真实 Task SUCCESS（FakeWorker 全链路），回复事实正确 |
+| 2 | 查询结果 | get_task_detail 观察含 SUCCESS，tool_call_count=1 |
+| 3 | 诊断失败 | 失败原因（EXECUTOR_FAILED/boom）进入回复 |
+| 4 | Retry 确认 | WRITE 确认停靠 → 肯定答复恢复执行 → 任务 SUCCESS |
+| 5 | 取消执行中任务 | SENT（派发后未接受）确认后 CANCELLED |
+| 6 | 设备不存在 | DEVICE_NOT_FOUND 观察 → ask_user 停靠；**不创建必败任务** |
+| 7 | 设备离线 Replan | 任务排队 PENDING + 查实时状态 + 事实性回复（不撒谎） |
+| 8 | 迟到事件 | CANCELLED 后迟到 SUCCESS → `task.late_result` 审计，任务不复活 |
+| 9 | 重复调用 | 每工具 max_calls=2 → 第 3 次 `MAX_CALLS_EXCEEDED` 观察，LLM 体面收尾 |
+| 10 | 危险调用拒绝 | script_path 参数走私 → `INVALID_ARGS`；未注册命令 → `COMMAND_NOT_FOUND`；零任务产生 |
+
+### 18.9 V1.2 里程碑记录（2026-09-08）
+
+- 迁移 0005：`agent_tool_calls` 表 + `agent_runs` 扩列（state_json/tool_call_count）， downgrade 完整。
+- 全量回归基线：**193 passed**（unit 契约/循环/确认/恢复/审计/服务 + agenthub 工具集成/Run API/10 场景验收）。
+- `AGENT_MODE=tool_agent` 生产切换待实机验证（当前生产继续跑 mvp 模式，行为零变化）。
+

@@ -52,6 +52,7 @@ from identity import DeviceIdentity, IdentityManager
 from reconnect import ReconnectManager
 from websocket import AUTH_CLOSE_CODES, WebSocketClient
 from worker.capability.cache import CapabilityCache
+from worker.capability.downloader import ArtifactDownloader
 from worker.capability.local_registry import scan_installed
 from worker.capability.manager import CapabilityManager
 from worker.capability.puller import PackagePuller
@@ -78,6 +79,9 @@ class DeviceClient:
         self.task_manager = TaskManager(
             capability_manager=self.capability_manager,
             artifact_uploader=ArtifactUploader(
+                server_url, lambda: self.identity.token if self.identity else ""
+            ),
+            artifact_downloader=ArtifactDownloader(
                 server_url, lambda: self.identity.token if self.identity else ""
             ),
         )

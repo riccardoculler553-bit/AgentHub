@@ -106,9 +106,13 @@ async def _wait_terminal(task_id: str, timeout: float) -> tuple[str | None, dict
             if time.monotonic() > deadline:
                 return status, None  # still RUNNING/PENDING: report, don't lie
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(event.wait()), timeout=settings.agent_poll_interval * 5
-                )
+                # Phase 5: NO shield. shield(event.wait()) leaks one pending
+                # Task per poll round on every timeout (the 52x "Task was
+                # destroyed but it is pending" flood of 2026-09-15): wait_for
+                # cancels only the shield, the inner waiter stays pending
+                # until GC. Plain wait_for cancels the waiter itself - safe,
+                # the Event supports arbitrarily many wait rounds.
+                await asyncio.wait_for(event.wait(), timeout=settings.agent_poll_interval * 5)
             except asyncio.TimeoutError:
                 continue
     finally:
@@ -266,12 +270,14 @@ def register_task_tools(registry: ToolRegistry, hub: Any = None) -> None:
     registry.register(
         AgentTool(
             name="retry_task",
-            description="重试一个失败/超时的任务（会重新派发执行并等待结果）。需要用户确认。",
+            # V1.5: 用户消息本身就是在要求重试，再要一次"是"确认只会造成
+            # 确认死循环（非"是"回复会取消 pending，用户换个说法又来一轮）。
+            description="重试一个失败/超时的任务（重新派发执行并等待结果）。",
             handler=retry_task,
             args_schema=RetryTaskArgs,
             risk_level=RiskLevel.WRITE,
-            requires_confirmation=True,
-            max_calls=1,
+            requires_confirmation=False,
+            max_calls=2,
             waits_task=True,
         )
     )

@@ -26,8 +26,10 @@ connection (PDF §108-§109).
 
 import asyncio
 import logging
+import shutil
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import protocol
@@ -36,6 +38,11 @@ from worker.capability.executors import create_executor
 from worker.capability.manager import CapabilityInstallError
 from worker.capability.result import CapabilityResult
 from worker.capability.uploader import ArtifactUploadFailed
+from worker.capability.downloader import (
+    ArtifactChecksumMismatch,
+    ArtifactDownloadCancelled,
+    ArtifactDownloadFailed,
+)
 from worker.executor import ExecutionError
 from worker.ledger import ExecutionLedger
 from worker.registry import build_command_registry
@@ -54,6 +61,14 @@ class _Outcome:
     metrics: dict = field(default_factory=dict)
 
 
+class _CapabilityInputError(Exception):
+    """Input artifact preparation failure carrying a §33 error code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
 class TaskManager:
     def __init__(
         self,
@@ -61,16 +76,19 @@ class TaskManager:
         ledger: ExecutionLedger | None = None,
         capability_manager=None,
         artifact_uploader=None,
+        artifact_downloader=None,
     ) -> None:
         self.registry = build_command_registry()
         self.ledger = ledger or ExecutionLedger()
         self.capability_manager = capability_manager
         self.artifact_uploader = artifact_uploader
+        self.artifact_downloader = artifact_downloader
         self.worker_id = ""
         self.max_concurrency = max(1, max_concurrency)
         self._active: dict[tuple[str, str], dict[str, Any]] = {}  # (task_id, step_id) -> state
         self._queue: asyncio.Queue = asyncio.Queue()
         self._consumer: asyncio.Task | None = None
+        self._flush_task: asyncio.Task | None = None
         self._ws_client = None
         # Startup recovery: RUNNING attempts from a previous process cannot be
         # tracked anymore - park them FAILED so reconnect reports the truth
@@ -85,7 +103,8 @@ class TaskManager:
         """(Re)bind the current WebSocketClient - called on every connect.
         Reconnection is the moment to flush unacknowledged results."""
         self._ws_client = ws_client
-        asyncio.create_task(self._flush_unreported())
+        # Strong ref: an unnamed fire-and-forget task can be GC'd mid-flight.
+        self._flush_task = asyncio.create_task(self._flush_unreported())
 
     def ensure_consumer(self) -> None:
         if self._consumer is None or self._consumer.done():
@@ -168,8 +187,8 @@ class TaskManager:
                 "duplicate dispatch for %s/%s (already %s)", task_id, step_id, active["status"]
             )
             await self._report(
-                f"{active['kind']}.running",
-                {"task_id": task_id, "step_id": step_id, "attempt_id": active["attempt_id"]},
+                self._echo_type(active), {"task_id": task_id, "step_id": step_id,
+                                          "attempt_id": active["attempt_id"]},
             )
             return
 
@@ -188,8 +207,12 @@ class TaskManager:
                     ledger_row_id=attempt_id,
                 )
             else:
+                # Non-terminal ledger row: the attempt was claimed but is still
+                # queued (or mid-run). Echo the truthful phase - ACCEPTED means
+                # received, never "executing".
+                msg = f"{kind}.running" if previous == "RUNNING" else f"{kind}.accept"
                 await self._report(
-                    f"{kind}.running",
+                    msg,
                     {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id},
                 )
             return
@@ -241,6 +264,7 @@ class TaskManager:
                 version=str(data.get("version", "")),
                 package_id=str(data.get("package_id", "")),
                 checksum=str(data.get("checksum") or "") or None,
+                input_artifacts=data.get("input_artifacts") or [],
             )
             if not state["capability"] or not state["version"]:
                 self.ledger.mark_finished(
@@ -278,6 +302,12 @@ class TaskManager:
             state["status"] = "cancelling"
             state["cancel"].set()
 
+    @staticmethod
+    def _echo_type(state: dict) -> str:
+        """Envelope type echoing the TRUE phase of an active attempt:
+        queued attempts report accept - they have not started executing."""
+        return f"{state['kind']}.running" if state["status"] == "running" else f"{state['kind']}.accept"
+
     # ---------------------------------------------------------------- consumer
 
     async def _consumer_loop(self) -> None:
@@ -285,6 +315,20 @@ class TaskManager:
             key = await self._queue.get()
             state = self._active.get(key)
             if state is None:  # cancelled before start
+                self._queue.task_done()
+                continue
+            if state["cancel"].is_set():
+                # Cancelled while queued: never execute. The attempt closes as
+                # CANCELLED here - otherwise a cancel arriving between intake
+                # and dequeue leaves an ACCEPTED task that silently never runs
+                # (Phase 2: every non-terminal state must have an exit).
+                state["status"] = "cancelled"
+                self.ledger.mark_finished(state["attempt_id"], "CANCELLED")
+                await self._report_result(
+                    state["task_id"], state["step_id"], state["attempt_id"], "cancelled",
+                    kind=state["kind"], ledger_row_id=state["attempt_id"],
+                )
+                self._active.pop(key, None)
                 self._queue.task_done()
                 continue
             state["status"] = "running"
@@ -299,10 +343,14 @@ class TaskManager:
         self.ledger.mark_running(attempt_id)
 
         async def progress(pct: int, message: str) -> None:
+            # Phase 8: per-attempt monotonic seq - the server drops any
+            # progress event whose seq would move the snapshot backwards.
+            state["progress_seq"] = int(state.get("progress_seq") or 0) + 1
             await self._report(
                 f"{state['kind']}.progress",
                 {"task_id": task_id, "step_id": step_id, "attempt_id": attempt_id,
-                 "progress": int(pct), "message": message},
+                 "progress": int(pct), "message": message,
+                 "seq": state["progress_seq"]},
             )
 
         await self._report(
@@ -369,7 +417,8 @@ class TaskManager:
     # ------------------------------------------------------ capability (V1.4)
 
     async def _run_capability(self, state: dict, progress) -> _Outcome:
-        """§43 Worker 本地执行流程: prepare package -> run -> upload -> normalize."""
+        """§43 Worker 本地执行流程 (V1.5 §16): prepare package -> prepare
+        inputs -> run -> upload -> normalize."""
         name, version = state["capability"], state["version"]
         if self.capability_manager is None:
             return _Outcome("failed", error={
@@ -382,12 +431,8 @@ class TaskManager:
                 name, version, state["package_id"], state["checksum"]
             )
             await progress(20, "package ready")
-            executor = create_executor(installed.manifest.runtime)
-            executor.validate(installed.manifest, state["params"])
         except CapabilityInstallError as exc:
             return _Outcome("failed", error={"code": exc.code, "message": str(exc)[:500]})
-        except ValueError as exc:
-            return _Outcome("failed", error={"code": "INVALID_PARAMS", "message": str(exc)[:500]})
 
         context = ExecutionContext(
             execution_id=state["attempt_id"],  # §41: execution_id == attempt_id
@@ -404,6 +449,21 @@ class TaskManager:
             step_run_id=state.get("step_run_id"),
             timeout=int(state.get("timeout") or 600),
         )
+
+        # V1.5 §16: download input artifacts into the workspace BEFORE
+        # validation - artifact_directory inputs become local dirs injected
+        # into params (role == manifest input name).
+        try:
+            await self._prepare_inputs(state, context, installed.manifest, progress)
+        except _CapabilityInputError as exc:
+            return _Outcome("failed", error={"code": exc.code, "message": str(exc)[:500]})
+
+        try:
+            executor = create_executor(installed.manifest.runtime)
+            executor.validate(installed.manifest, state["params"])
+        except ValueError as exc:
+            return _Outcome("failed", error={"code": "INVALID_PARAMS", "message": str(exc)[:500]})
+
         result = await executor.execute(context, progress, state["cancel"])
         if not isinstance(result, CapabilityResult):  # defensive against runtimes
             result = CapabilityResult.ok(data={"output": str(result)[:2000]})
@@ -422,8 +482,65 @@ class TaskManager:
             return _Outcome("cancelled", ledger_status="CANCELLED")
         return _Outcome("failed", error={
             "code": payload.get("error_code") or "CAPABILITY_EXECUTION_FAILED",
-            "message": str(payload.get("message", ""))[:500],
+            # V1.5: keep the TAIL (traceback / business ERROR lines) — a head
+            # truncation here used to cut the traceback off the report.
+            "message": str(payload.get("message", ""))[-1000:],
         })
+
+    async def _prepare_inputs(self, state: dict, context: ExecutionContext, manifest, progress) -> None:
+        """V1.5 §16/§31/§54: download input artifacts into the execution
+        workspace and inject the resolved directories into params.
+
+        role == manifest input name (server stores the reference under that
+        role, §15). The manifest spec may name the workspace subdir explicitly
+        ({"path": "input"}); default is the role name itself."""
+        entries = state.get("input_artifacts") or []
+        if not entries:
+            return
+        if self.artifact_downloader is None:
+            raise _CapabilityInputError(
+                "ARTIFACT_DOWNLOAD_FAILED", "artifact downloader not configured on this worker"
+            )
+        specs = {
+            str(input_name): spec
+            for input_name, spec in (manifest.inputs or {}).items()
+            if isinstance(spec, dict) and spec.get("type") == "artifact_directory"
+        }
+        exec_dir = context.execution_dir()
+        params = state["params"]
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or not str(entry.get("artifact_id", "")).strip():
+                raise _CapabilityInputError(
+                    "INVALID_PARAMS", f"input_artifacts[{index}] missing artifact_id"
+                )
+            if state["cancel"].is_set():
+                return
+            artifact_id = str(entry["artifact_id"])
+            role = str(entry.get("role") or "input")
+            spec = specs.get(role) or {}
+            subdir = Path(str(spec.get("path") or role)).name  # no traversal
+            dest_dir = exec_dir / subdir
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                cached = await self.artifact_downloader.download(
+                    artifact_id, checksum=entry.get("checksum"), cancel=state["cancel"]
+                )
+            except ArtifactDownloadCancelled as exc:
+                raise _CapabilityInputError("CAPABILITY_CANCELLED", str(exc)) from exc
+            except ArtifactChecksumMismatch as exc:
+                raise _CapabilityInputError("ARTIFACT_CHECKSUM_MISMATCH", str(exc)) from exc
+            except ArtifactDownloadFailed as exc:
+                raise _CapabilityInputError("ARTIFACT_DOWNLOAD_FAILED", str(exc)) from exc
+            filename = Path(str(entry.get("name") or "").strip() or f"{artifact_id}.bin").name
+            dest = dest_dir / filename
+            if dest.exists():
+                dest = dest_dir / f"{artifact_id[:8]}_{filename}"
+            await asyncio.to_thread(shutil.copyfile, cached, dest)
+            # §21: the capability receives paths, never artifact ids.
+            if role in specs:
+                params[role] = str(dest_dir)
+            logger.info("input artifact %s (%s) -> %s", artifact_id, filename, dest)
+            await progress(30, f"input ready: {filename}")
 
     async def _upload_artifacts(self, state: dict, files) -> list[dict] | _Outcome:
         """Upload produced files (§45: the result only carries artifact IDs)."""

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.auth.admin import require_admin
+from app.core.background import spawn
 from app.core.exceptions import DeviceLinkError
 from app.db.database import get_db
 from app.device.models import (
@@ -86,7 +87,7 @@ async def revoke_device(device_id: str, request: Request, db: Session = Depends(
         db.rollback()
         raise _to_http_error(exc) from exc
     # Drop live connections; the client should stop reconnecting on 4403.
-    asyncio.create_task(hub.close_device(device_id, code=4403, reason="device revoked"))
+    spawn(hub.close_device(device_id, code=4403, reason="device revoked"))
     return service.to_out(device, connection_count=0)
 
 

@@ -211,7 +211,9 @@ def build_mvp_graph(hub) -> "object":  # compiled StateGraph
                         )
                     }
                 try:
-                    await asyncio.wait_for(asyncio.shield(event.wait()), timeout=settings.agent_poll_interval * 5)
+                    # Phase 5: no shield (see task._wait_terminal) - a shielded
+                    # waiter leaks one pending Task per poll round.
+                    await asyncio.wait_for(event.wait(), timeout=settings.agent_poll_interval * 5)
                 except asyncio.TimeoutError:
                     continue
         finally:

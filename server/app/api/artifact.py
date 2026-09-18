@@ -1,15 +1,18 @@
-"""Artifact APIs (V1.4 §64).
+"""Artifact APIs (V1.4 §64 / V1.5 §13).
 
-POST /api/artifacts        - Worker upload (device Bearer token), multipart
-GET  /api/artifacts        - Admin list (by task/workflow)
-GET  /api/artifacts/{id}   - Admin download (artifact bytes)
-DELETE /api/artifacts/{id} - Admin delete (lifecycle-controlled)
+POST /api/artifacts            - Worker upload (device Bearer token), multipart
+GET  /api/artifacts            - Admin list (by task/workflow)
+GET  /api/artifacts/{id}       - Admin detail
+GET  /api/artifacts/{id}/download - Worker (device Bearer) or Admin download
+DELETE /api/artifacts/{id}     - Admin delete (lifecycle-controlled)
 """
 
 import hmac
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.artifact import models as schemas
@@ -22,6 +25,8 @@ from app.api.capability import _device_from_bearer
 
 admin_router = APIRouter(prefix="/api/artifacts", tags=["artifact"], dependencies=[Depends(require_admin)])
 upload_router = APIRouter(prefix="/api/artifacts", tags=["artifact"])
+# V1.5 §13: workers download input artifacts over HTTP (data plane).
+download_router = APIRouter(prefix="/api/artifacts", tags=["artifact"])
 
 
 def _artifact_out(row) -> schemas.ArtifactOut:
@@ -86,6 +91,54 @@ def list_artifacts(
     ]
 
 
+@admin_router.get("/scan")
+def scan_directory(dir: str):
+    """List uploadable files of a server-local directory (dashboard 数据源注册).
+
+    Admin-only; first-level files only (hidden / Excel lock files skipped).
+    Must be declared BEFORE /{artifact_id} so "scan" is not swallowed."""
+    path = _resolve_local_dir(dir)
+    files = [
+        {"name": f.name, "size": f.stat().st_size}
+        for f in sorted(path.iterdir())
+        if f.is_file() and not f.name.startswith(("~$", "."))
+    ]
+    return {"dir": str(path), "files": files}
+
+
+class RegisterLocalIn(BaseModel):
+    """Server-local file registration request (dashboard 数据源注册)."""
+
+    dir: str = Field(min_length=1, max_length=500)
+    name: str = Field(min_length=1, max_length=300)
+
+
+def _resolve_local_dir(dir: str) -> Path:
+    if not Path(dir).is_absolute():
+        raise HTTPException(status_code=400, detail={"code": "invalid_dir", "message": "dir must be an absolute path"})
+    path = Path(dir)
+    if not path.is_dir():
+        raise HTTPException(status_code=404, detail={"code": "dir_not_found", "message": f"directory not found: {dir}"})
+    return path
+
+
+@admin_router.post("/register-local", response_model=schemas.ArtifactOut, status_code=201)
+def register_local_artifact(payload: RegisterLocalIn, db: Session = Depends(get_db)):
+    """Register a server-local file as an Artifact WITHOUT pushing the bytes
+    through the browser - the server reads its own disk (V1.5 §26 数据平面).
+
+    Admin-only; the file must live under the given directory (no traversal)."""
+    base = _resolve_local_dir(payload.dir)
+    path = base / Path(payload.name).name  # bare filename -> no traversal
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "file_not_found", "message": f"file not found: {path}"},
+        )
+    row = ArtifactService(db).create_artifact(name=path.name, content=path.read_bytes(), type="file")
+    return _artifact_out(row)
+
+
 @admin_router.get("/{artifact_id}", response_model=schemas.ArtifactOut)
 def get_artifact(artifact_id: str, db: Session = Depends(get_db)):
     try:
@@ -94,13 +147,26 @@ def get_artifact(artifact_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail={"code": "artifact_not_found", "message": str(exc)}) from exc
 
 
-@admin_router.get("/{artifact_id}/download")
-def download_artifact(artifact_id: str, db: Session = Depends(get_db)):
+@download_router.get("/{artifact_id}/download")
+def download_artifact(
+    artifact_id: str,
+    authorization: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """Artifact bytes for the data plane (V1.5 §13): the Worker downloads its
+    input artifacts with the device Bearer token; the admin token also works
+    for manual inspection."""
+    expected = settings.admin_token
+    if not (expected and x_admin_token and hmac.compare_digest(x_admin_token, expected)):
+        _device_from_bearer(authorization, db)  # raises 401 on a bad token
     try:
         row = ArtifactService(db).get_artifact(artifact_id)
     except ArtifactNotFound as exc:
         raise HTTPException(status_code=404, detail={"code": "artifact_not_found", "message": str(exc)}) from exc
-    path = settings.storage_dir / row.storage_path
+    # storage_path is relative to the artifacts root (V1.4 bug: was relative
+    # to storage_dir, so every download 404'd with "artifact blob missing")
+    path = ArtifactService.artifacts_root() / row.storage_path
     if not path.is_file():
         raise HTTPException(status_code=404, detail={"code": "artifact_not_found", "message": "artifact blob missing"})
     from app.artifact.service import safe_artifact_name

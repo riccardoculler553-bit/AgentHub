@@ -96,7 +96,8 @@ async def _call_policy(policy, name: str, args: dict, confirmed: bool = False):
 
 
 def test_default_registry_has_standard_tools(registry):
-    """V1.4: nine V1.2 tools + five workflow tools + three capability tools (17)."""
+    """V1.5: nine V1.2 tools + five workflow tools + three capability tools
+    + one artifact tool (18)."""
     expected = {
         "list_devices": ("READ", False),
         "get_device_status": ("READ", False),
@@ -104,7 +105,7 @@ def test_default_registry_has_standard_tools(registry):
         "get_recent_tasks": ("READ", False),
         "get_task_detail": ("READ", False),
         "get_task_events": ("READ", False),
-        "retry_task": ("WRITE", True),
+        "retry_task": ("WRITE", False),
         "cancel_task": ("WRITE", True),
         "execute_command": ("ACTION", settings.agent_confirm_actions),
         # V1.3 workflow tools (§115-§117)
@@ -117,6 +118,8 @@ def test_default_registry_has_standard_tools(registry):
         "list_capabilities": ("READ", False),
         "get_capability": ("READ", False),
         "run_capability": ("ACTION", settings.agent_confirm_actions),
+        # V1.5 artifact tool (结果落盘)
+        "save_artifact": ("WRITE", False),
     }
     assert {t.name for t in registry.all()} == set(expected)
     for name, (risk, confirm) in expected.items():
@@ -200,11 +203,12 @@ async def test_get_task_detail_unknown(registry):
 
 
 @pytest.mark.anyio
-async def test_retry_requires_confirmation(policy, device):
+async def test_retry_does_not_require_confirmation(policy, device):
+    """V1.5: 用户消息本身就是重试指令，retry_task 不再走确认门 ——
+    之前的确认流程会造成"提示确认 → 非'是'回复取消 → 再要求确认"死循环。"""
     tid = _create_echo_task(device["device_id"])
     r = await _call_policy(policy, "retry_task", {"task_id": tid})
-    assert r.error_code == ToolErrorCodes.CONFIRMATION_REQUIRED
-    assert r.data == {"pending_args": {"task_id": tid}}
+    assert r.error_code != ToolErrorCodes.CONFIRMATION_REQUIRED
 
 
 @pytest.mark.anyio

@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.auth.admin import require_admin
+from app.core.background import spawn
 from app.db.database import get_db
 from app.task.dispatcher import TaskDispatcher
 from app.workflow import schemas
@@ -100,7 +101,7 @@ async def create_run(
     except WorkflowError as exc:
         raise _workflow_error(exc) from exc
     for task_id in dispatch_ids:
-        asyncio.create_task(TaskDispatcher(request.app.state.hub).dispatch_task(task_id))
+        spawn(TaskDispatcher(request.app.state.hub).dispatch_task(task_id))
     return service.run_out(run)
 
 
@@ -138,7 +139,7 @@ async def cancel_run(run_id: str, request: Request, db: Session = Depends(get_db
     if task_id:
         from app.task.monitor import TaskMonitor
 
-        asyncio.create_task(TaskMonitor(request.app.state.hub).notify_cancel(task_id))
+        spawn(TaskMonitor(request.app.state.hub).notify_cancel(task_id))
     return service.run_out(service.get_run(run_id))
 
 

@@ -31,6 +31,9 @@ class TaskMonitor:
         self.hub = hub
         self.sweep_interval = sweep_interval
         self.dispatcher = TaskDispatcher(hub)
+        # Phase 2: stop instructions already (re-)delivered per
+        # (task_id, attempt_id) - one delivery is enough per attempt.
+        self._stop_sent: set[tuple[str, str]] = set()
 
     async def run(self) -> None:
         logger.info(
@@ -42,6 +45,7 @@ class TaskMonitor:
             try:
                 await self.dispatch_pending()
                 await self.timeout_scan()
+                await self.reconcile_stale()
             except Exception:
                 logger.exception("task monitor sweep failed")
             await asyncio.sleep(self.sweep_interval)
@@ -57,7 +61,11 @@ class TaskMonitor:
             )
             dispatchable: list[str] = []
             for task in pending:
-                if now - task.created_at > max_wait:
+                # Phase 2: the offline-max-wait window restarts every time the
+                # task enters PENDING (create/retry/rollback); created_at alone
+                # insta-timed-out retried old tasks.
+                pending_since = task.pending_since or task.created_at
+                if now - pending_since > max_wait:
                     svc.timeout_pending(task)
                     logger.warning("task %s TIMEOUT (device offline max wait elapsed)", task.task_id)
                 elif task.execution_type == "CAPABILITY" or (
@@ -83,6 +91,16 @@ class TaskMonitor:
                     )
                 )
             )
+            # Phase 2: a SENT task whose device dropped before accepting gets
+            # a bounded wait too (offline max wait), not the full timeout -
+            # TIMEOUT is retryable, an ACCEPTED-forever state is not.
+            max_wait = timedelta(seconds=settings.task_offline_max_wait)
+            for task in db.scalars(select(Task).where(Task.status == "SENT")):
+                if task.target_device_id and not self.hub.is_device_online(task.target_device_id):
+                    attempts = svc.get_attempts(task.task_id)
+                    last_dispatch = max((a.created_at for a in attempts), default=None)
+                    if last_dispatch is not None and now - last_dispatch > max_wait:
+                        svc.timeout_running(task)
             expired = [svc.timeout_running(task) for task in live]
         for result in expired:
             if not result.get("notify_device"):
@@ -98,19 +116,48 @@ class TaskMonitor:
             attempt_id, step_id = TaskService(db)._current_attempt_ids(task_id)
         await self._send_cancel(task_id, attempt_id, step_id)
 
-    async def _send_cancel(self, task_id: str, attempt_id: str | None, step_id: str | None) -> None:
+    async def reconcile_stale(self) -> None:
+        """Phase 2: attempts may never outlive their task (§17 error recovery).
+
+        Re-delivers stop instructions to devices that missed the original
+        cancel/timeout (bounded by task_cancel_resend_window), then closes the
+        attempt STALE when the device stays unreachable."""
+        with SessionLocal() as db:
+            actions = TaskService(db).reconcile_terminal_attempts(
+                settings.task_cancel_resend_window
+            )
+        for action in actions:
+            key = (action["task_id"], action["attempt_id"])
+            if key in self._stop_sent:
+                continue
+            sent = await self._send_cancel(
+                action["task_id"], action["attempt_id"], action["step_id"]
+            )
+            if sent:
+                self._stop_sent.add(key)
+                logger.warning(
+                    "re-sent stop for terminal task %s (attempt %s)", action["task_id"], action["attempt_id"]
+                )
+
+    async def _send_cancel(self, task_id: str, attempt_id: str | None, step_id: str | None) -> int:
         task_row = await self._load(task_id)
         if not task_row or not task_row.target_device_id:
-            return
+            return 0
         data: dict = {"task_id": task_id}
         if step_id:
             data["step_id"] = step_id
         if attempt_id:
             data["attempt_id"] = attempt_id
-        await self.hub.send_to_device(
+        sent = await self.hub.send_to_device(
             task_row.target_device_id,
             Envelope(id=new_message_id(), type=MessageType.TASK_CANCEL, data=data),
         )
+        if not sent:
+            # Phase 2: undeliverable stop is observable, never silent.
+            logger.warning(
+                "task.cancel for %s undelivered (device %s offline)", task_id, task_row.target_device_id
+            )
+        return sent
 
     def recover_stuck_dispatching(self) -> int:
         """Server-restart recovery (V1.1 §42): tasks left in DISPATCHING by a
@@ -132,6 +179,7 @@ class TaskMonitor:
                     if step.status == "PENDING":
                         step.current_attempt_id = None
                 task.status = "PENDING"
+                task.pending_since = utcnow()
                 svc._record(task.task_id, "task.recovered", payload={"reason": "server_restart"})
                 recovered += 1
             if recovered:

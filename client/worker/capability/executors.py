@@ -12,21 +12,43 @@ from task params; there is no arbitrary shell/local executor in V1.4.
 """
 
 import asyncio
+import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
+from worker.capability.cache import work_root
 from worker.capability.context import ExecutionContext
 from worker.capability.manifest import Manifest
 from worker.capability.result import CapabilityResult
 from worker.executors.yingdao import YingdaoExecutor
 
+logger = logging.getLogger(__name__)
+
 _POLL_INTERVAL = 0.2
 _ENTRY_SAFE = re.compile(r"^[A-Za-z0-9_]+$")
 _HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+
+
+class _EnvironmentError(Exception):
+    """Python environment preparation failure carrying a §33 error code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
+
+class _ChildFailed(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
 
 
 class CapabilityExecutor:
@@ -99,9 +121,25 @@ class PythonCapabilityExecutor(CapabilityExecutor):
             (exec_dir / "result.json").unlink()
         except OSError:
             pass
-        context.write_context()
-        (exec_dir / "params.json").write_text(
-            json.dumps(context.params, ensure_ascii=False, indent=2), encoding="utf-8"
+
+        # V1.5 §35/§42: inject declared artifact_directory outputs - the
+        # workspace owns the paths (and creates them), the capability just
+        # consumes them (params[<name>]).
+        output_dir = ""
+        for out_name, spec in (context.manifest.outputs or {}).items():
+            if isinstance(spec, dict) and spec.get("type") == "artifact_directory":
+                subdir = Path(str(spec.get("path") or "output")).name
+                out_path = exec_dir / subdir
+                out_path.mkdir(parents=True, exist_ok=True)
+                output_dir = str(out_path)
+                context.params[str(out_name)] = output_dir
+
+        # Phase 7: context/params persistence is data-plane IO - off the loop.
+        await asyncio.to_thread(context.write_context)
+        await asyncio.to_thread(
+            (exec_dir / "params.json").write_text,
+            json.dumps(context.params, ensure_ascii=False, indent=2),
+            "utf-8",
         )
         await progress(5, f"starting {script.name}")
 
@@ -111,22 +149,39 @@ class PythonCapabilityExecutor(CapabilityExecutor):
             CAPABILITY_CONTEXT=json.dumps(context.to_dict(), ensure_ascii=False),
             CAPABILITY_PACKAGE_DIR=str(package_dir),
             CAPABILITY_EXECUTION_DIR=str(exec_dir),
+            # 子电脑控制台代码页多为 GBK：强制子进程统一 UTF-8 输出，
+            # 否则捕获到的业务 ERROR 行全是替换符（2026-09-14 实测）。
+            PYTHONUTF8="1",
+            PYTHONIOENCODING="utf-8",
         )
+        if output_dir:
+            env["CAPABILITY_OUTPUT_DIR"] = output_dir
+
+        # V1.5 §29: dedicated venv per (capability, version) when the package
+        # ships requirements.txt; sys.executable otherwise.
+        try:
+            python_exe = await self._ensure_environment(context, progress, cancel)
+        except _EnvironmentError as exc:
+            if exc.code == "CAPABILITY_CANCELLED" or cancel.is_set():
+                return CapabilityResult.fail("CAPABILITY_CANCELLED", "cancelled by server")
+            return CapabilityResult.fail(exc.code, exc.message)
+
         # Output goes to temp files, not pipes: polling a piped child with
         # repeated communicate(timeout=...) is broken on Windows (returns
         # early with a stale returncode) and large output can deadlock the
         # child on a full pipe buffer. wait(timeout) + files has neither issue.
-        import tempfile as _tempfile
-
         try:
-            out_f = _tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
-            err_f = _tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+            out_f = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+            err_f = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
         except OSError as exc:
             return CapabilityResult.fail("CAPABILITY_EXECUTION_FAILED", f"output capture failed: {exc}")
         try:
             try:
-                proc = subprocess.Popen(
-                    [sys.executable, str(script)],
+                # Phase 7: Popen does blocking process creation - keep it off
+                # the event loop (Windows CreateProcess can take 100ms+).
+                proc = await asyncio.to_thread(
+                    subprocess.Popen,
+                    [python_exe, str(script)],
                     stdout=out_f,
                     stderr=err_f,
                     text=True,
@@ -167,13 +222,136 @@ class PythonCapabilityExecutor(CapabilityExecutor):
             out_f.close()
             err_f.close()
 
+        # V1.5 diagnostics: persist the FULL child output for post-mortem —
+        # the reported message only carries the last 800 chars, and warning
+        # noise (calamine dtype fallback etc.) can bury the real crash.
+        # Phase 7: output capture files can hold GBs - write off the loop.
+        try:
+            await asyncio.to_thread(
+                (exec_dir / "stdout.log").write_text, stdout or "", "utf-8"
+            )
+            await asyncio.to_thread(
+                (exec_dir / "stderr.log").write_text, stderr or "", "utf-8"
+            )
+        except OSError:
+            pass
+
         if proc.returncode != 0:
-            tail = (stderr or stdout or "")[-800:] or f"exit {proc.returncode}"
-            return CapabilityResult.fail("CAPABILITY_EXECUTION_FAILED", tail)
+            # 业务失败走 stdout（log=print），运行时警告走 stderr —— 只取其一
+            # 会把真因埋掉，两段 tail 都带上（stdout 多给些空间放业务 ERROR 行）。
+            tail = (stderr or "")[-300:]
+            out_tail = (stdout or "")[-700:]
+            detail = tail if not out_tail else f"{tail}\n--- stdout ---\n{out_tail}"
+            return CapabilityResult.fail(
+                "CAPABILITY_EXECUTION_FAILED",
+                f"exit {proc.returncode}: {detail.strip() or 'no output'}",
+            )
 
         payload = self._collect_result(exec_dir, stdout)
         files = _artifact_files(payload.pop("artifacts", None), exec_dir)
+        if not files:
+            # V1.5 §35: no explicit artifact list -> scan the declared output
+            # directory (default output/) and upload everything found.
+            # Phase 7: recursive directory scan runs on a thread.
+            files = await asyncio.to_thread(_scan_output_dirs, exec_dir, context.manifest)
         return CapabilityResult.ok(data=payload, artifact_files=files)
+
+    # ------------------------------------------------------------- python env
+
+    async def _ensure_environment(self, context: ExecutionContext, progress, cancel: asyncio.Event) -> str:
+        """V1.5 §29/§30: venv + pip install -r requirements.txt.
+
+        Cached per (capability, version) under <work>/envs; the .deps_ok
+        marker stores the requirements hash so dependency changes re-install.
+        Returns the interpreter path to run the entrypoint with."""
+        requirements = Path(context.package_dir) / "requirements.txt"
+        if not requirements.is_file():
+            return sys.executable
+        try:
+            req_hash = hashlib.sha256(requirements.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise _EnvironmentError("PYTHON_ENV_CREATE_FAILED", f"unreadable requirements.txt: {exc}") from exc
+
+        env_dir = work_root() / "envs" / context.capability / context.version
+        python_exe = env_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        marker = env_dir / ".deps_ok"
+        if python_exe.is_file():
+            try:
+                if marker.read_text(encoding="utf-8").strip() == req_hash:
+                    return str(python_exe)
+            except OSError:
+                pass
+
+        await progress(10, "creating python environment")
+        if cancel.is_set():
+            raise _EnvironmentError("CAPABILITY_CANCELLED", "cancelled by server")
+        try:
+            await self._run_child(
+                [sys.executable, "-m", "venv", str(env_dir)], cancel, "PYTHON_ENV_CREATE_FAILED"
+            )
+        except _ChildFailed as exc:
+            raise _EnvironmentError(exc.code, exc.message) from exc
+
+        await progress(15, "installing dependencies")
+        try:
+            await self._run_child(
+                [
+                    str(python_exe), "-m", "pip", "install",
+                    "--disable-pip-version-check", "-r", str(requirements),
+                ],
+                cancel,
+                "DEPENDENCY_INSTALL_FAILED",
+            )
+        except _ChildFailed as exc:
+            raise _EnvironmentError(exc.code, exc.message) from exc
+        if cancel.is_set():
+            raise _EnvironmentError("CAPABILITY_CANCELLED", "cancelled by server")
+
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(req_hash, encoding="utf-8")
+        except OSError as exc:
+            raise _EnvironmentError("PYTHON_ENV_CREATE_FAILED", f"marker write failed: {exc}") from exc
+        logger.info("python env ready: %s", env_dir)
+        return str(python_exe)
+
+    async def _run_child(self, cmd: list[str], cancel: asyncio.Event, code: str) -> None:
+        """Cancel-aware blocking child (venv/pip); output captured to temp files."""
+        try:
+            out_f = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+            err_f = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise _ChildFailed(code, f"output capture failed: {exc}") from exc
+        try:
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=out_f, stderr=err_f, text=True, encoding="utf-8",
+                )
+            except OSError as exc:
+                raise _ChildFailed(code, f"process start failed: {exc}") from exc
+
+            def _wait() -> str:
+                while True:
+                    if cancel.is_set():
+                        return "cancelled"
+                    try:
+                        proc.wait(timeout=_POLL_INTERVAL)
+                        return "exited"
+                    except subprocess.TimeoutExpired:
+                        continue
+
+            verdict = await asyncio.to_thread(_wait)
+            if verdict == "cancelled":
+                _kill(proc)
+                raise _ChildFailed("CAPABILITY_CANCELLED", "cancelled by server")
+            if proc.returncode != 0:
+                out_f.seek(0)
+                err_f.seek(0)
+                tail = (err_f.read() or out_f.read() or "")[-800:] or f"exit {proc.returncode}"
+                raise _ChildFailed(code, tail)
+        finally:
+            out_f.close()
+            err_f.close()
 
     @staticmethod
     def _collect_result(exec_dir: Path, stdout: str) -> dict:
@@ -216,6 +394,30 @@ def _artifact_files(entries, exec_dir: Path) -> list[tuple[str, Path]]:
             continue
         name = str(entry.get("name") or resolved.name)
         files.append((name, resolved))
+    return files
+
+
+def _scan_output_dirs(exec_dir: Path, manifest: Manifest) -> list[tuple[str, Path]]:
+    """V1.5 §35: collect every file from the declared artifact_directory
+    outputs (default output/) - the no-result.json fallback."""
+    subdirs: list[str] = []
+    for spec in (manifest.outputs or {}).values():
+        if isinstance(spec, dict) and spec.get("type") == "artifact_directory":
+            subdirs.append(Path(str(spec.get("path") or "output")).name)
+    if not subdirs:
+        subdirs = ["output"]
+    files: list[tuple[str, Path]] = []
+    for subdir in subdirs:
+        base = exec_dir / subdir
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(base)
+            if path.name.startswith(("~$", "__tmp_", ".")) or "backup" in rel.parts:
+                continue
+            files.append((path.name, path))
     return files
 
 

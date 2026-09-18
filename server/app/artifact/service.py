@@ -119,7 +119,9 @@ class ArtifactService:
 
     def read_artifact_bytes(self, artifact_id: str) -> tuple[Artifact, bytes]:
         row = self.get_artifact(artifact_id)
-        path = settings.storage_dir / row.storage_path
+        # storage_path is relative to the artifacts root (same as the
+        # download endpoint; storage_dir directly was the V1.4 bug)
+        path = self.artifacts_root() / row.storage_path
         try:
             return row, path.read_bytes()
         except OSError as exc:
@@ -127,7 +129,7 @@ class ArtifactService:
 
     def delete_artifact(self, artifact_id: str) -> None:
         row = self.get_artifact(artifact_id)
-        path = settings.storage_dir / row.storage_path
+        path = self.artifacts_root() / row.storage_path
         try:
             path.unlink(missing_ok=True)
         except OSError:

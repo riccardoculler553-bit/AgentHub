@@ -224,7 +224,15 @@ class ToolPolicy:
 
         # 7. execute (AgentTool.run converts handler errors to ToolResult)
         audit_row = _audit_start(self.run_id, call_id, tool_name, validated) if self.run_id else None
-        result = await tool.run(db, validated)
+        # Phase 3/4: expose the run id to handlers (run_capability links
+        # Task -> AgentRun for the terminal notification).
+        from app.agent.tools.context import current_run_id
+
+        run_token = current_run_id.set(self.run_id or "")
+        try:
+            result = await tool.run(db, validated)
+        finally:
+            current_run_id.reset(run_token)
         result.with_call(call_id, tool_name)
         self._per_tool[tool_name] = self.calls_of(tool_name) + 1
         self._total += 1

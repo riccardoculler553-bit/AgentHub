@@ -34,10 +34,20 @@ import app.core.config as _config  # noqa: E402
 # .env may define AGENTHUB_ADMIN_TOKEN; tests exercise the open mode
 # (empty token disables admin auth by contract).
 _config.settings.admin_token = ""
+# .env may switch the message-facing agent (production runs tool_agent) -
+# tests pin the mode explicitly so .env changes never flip expectations.
+_config.settings.agent_mode = "mvp"
 # .env may now configure a real LLM key (e.g. Zhipu GLM): load_dotenv refills
 # os.environ after our pop above, so force-disable LLM on the settings object
 # itself - tests must be deterministic and offline (rules fallback only).
 _config.settings.openai_api_key = None
+# Same landmine for the DingTalk Stream client: load_dotenv refills the robot
+# credentials, and a long-enough test lets it CONNECT to the production robot
+# (stealing its message stream, then blocking session teardown). Tests never
+# touch DingTalk - disable it on the settings object itself.
+_config.settings.dingtalk_client_id = None
+_config.settings.dingtalk_client_secret = None
+_config.settings.dingtalk_robot_code = None
 
 # Tests own their tool table: server/config/agent_tools.json is user-editable
 # at runtime (label/keywords/devices), so tests must not depend on it.
@@ -77,6 +87,16 @@ def _restore_tool_registry():
     yield
     _config.settings.agent_tools_config = TEST_TOOLS_CONFIG
     _tool_registry.reload()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_work_root(tmp_path, monkeypatch):
+    """Per-test worker work tree (DEVICELINK_WORK_DIR).
+
+    Execution dirs are keyed by attempt_id, which many tests reuse
+    ("attempt_1"); with only the session-level DEVICELINK_HOME they collide
+    and V1.5 output scanning would read stale files from earlier tests."""
+    monkeypatch.setenv("DEVICELINK_WORK_DIR", str(tmp_path / "work"))
 
 from app.db.database import Base, engine  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402

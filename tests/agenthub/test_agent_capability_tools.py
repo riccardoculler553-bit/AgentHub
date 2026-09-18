@@ -91,7 +91,7 @@ async def test_run_capability_end_to_end(client, registry, device):
     try:
         r = await _call(
             registry, "run_capability",
-            {"capability": "erp.order.export", "params": {"start_date": "2026-09-09"}},
+            {"capability": "erp.order.export", "params": {"start_date": "2026-09-09"}, "wait": True},
         )
         assert r.success, r
         data = r.data
@@ -126,8 +126,79 @@ async def test_run_capability_unpinned_version_resolves_current(client, registry
     worker = FakeWorker(client, device["device_token"], behaviour="success")
     worker.start()
     try:
-        r = await _call(registry, "run_capability", {"capability": "erp.order.export"})
+        r = await _call(registry, "run_capability", {"capability": "erp.order.export", "wait": True})
         assert r.success, r
         assert r.data["version"] == "1.0.0"
+    finally:
+        worker.stop()
+
+
+# ---------------------------------------------------- V1.5 §11 device / §15 inputs
+
+
+@pytest.mark.anyio
+async def test_run_capability_resolves_device_name(client, registry, device):
+    """§11: the Agent speaks device NAMES; only the resolved id reaches the
+    execution layer (persisted on the task by the dispatcher)."""
+    from app.task.db_models import Task
+
+    _publish_capability(client)
+    worker = FakeWorker(client, device["device_token"], behaviour="success")
+    worker.start()
+    try:
+        r = await _call(registry, "run_capability", {
+            "capability": "erp.order.export", "device": "能力工具测试机", "wait": True,
+        })
+        assert r.success, r
+        with SessionLocal() as db:
+            task = db.scalars(
+                select(Task).where(Task.task_id == r.data["task_id"])
+            ).first()
+            assert task is not None
+            assert task.target_device_id == device["device_id"]
+    finally:
+        worker.stop()
+
+
+@pytest.mark.anyio
+async def test_run_capability_unknown_device_fails(client, registry):
+    r = await _call(
+        registry, "run_capability",
+        {"capability": "erp.order.export", "device": "不存在的电脑"},
+    )
+    assert not r.success
+    assert r.error_code == "DEVICE_NOT_FOUND"
+
+
+@pytest.mark.anyio
+async def test_run_capability_with_input_artifacts(client, registry, device):
+    """§15/§26: tool inputs -> task artifact references -> dispatch refs."""
+    _publish_capability(client)
+    worker = FakeWorker(client, device["device_token"], behaviour="success")
+    worker.start()
+    try:
+        res = client.post(
+            "/api/artifacts",
+            files={"file": ("data.xlsx", b"INPUT-BYTES", "application/octet-stream")},
+            data={"name": "data.xlsx", "type": "file"},
+            headers={"Authorization": f"Bearer {device['device_token']}"},
+        )
+        assert res.status_code == 201, res.text
+        artifact_id = res.json()["artifact_id"]
+
+        r = await _call(registry, "run_capability", {
+            "capability": "erp.order.export",
+            "device": "能力工具测试机",
+            "inputs": {"data_dir": [artifact_id]},
+            "wait": True,
+        })
+        assert r.success, r
+        execute = next(m for m in worker.received if m.get("type") == "capability.execute")
+        refs = execute["data"]["input_artifacts"]
+        assert len(refs) == 1
+        assert refs[0]["artifact_id"] == artifact_id
+        assert refs[0]["name"] == "data.xlsx"
+        assert refs[0]["role"] == "data_dir"
+        assert refs[0]["checksum"]  # worker verifies against this
     finally:
         worker.stop()

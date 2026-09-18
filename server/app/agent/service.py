@@ -20,6 +20,7 @@ from app.agent.core.runner import AgentRunner
 from app.agent.llm.service import LLMService
 from app.agent.runs import STATUS_WAITING_USER, AgentRunService
 from app.agent.tools.registry import build_default_registry
+from app.core.background import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +94,9 @@ class AgentService:
                 run_id = run.run_id
                 resume = False
         if resume:
-            asyncio.create_task(self._resume_task(run_id, text))
+            spawn(self._resume_task(run_id, text))
         else:
-            asyncio.create_task(
+            spawn(
                 self._execute_new(
                     run_id,
                     text,
@@ -127,7 +128,7 @@ class AgentService:
                 )
                 .run_id
             )
-        asyncio.create_task(
+        spawn(
             self._execute_new(
                 run_id,
                 text,
@@ -161,7 +162,7 @@ class AgentService:
 
     def schedule_resume(self, run_id: str, message: str) -> None:
         """Resume in the background (API callers never block on the graph)."""
-        asyncio.create_task(self._resume_task(run_id, message))
+        spawn(self._resume_task(run_id, message))
 
     def cancel_run(self, run_id: str) -> str:
         """Stop an open run (V1.2 §90: the run closes; business tasks are NOT

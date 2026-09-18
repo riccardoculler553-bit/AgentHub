@@ -109,6 +109,7 @@ class TaskService:
             workflow_run_id=payload.workflow_run_id,
             workflow_step_run_id=payload.workflow_step_run_id,
             execution_type="LEGACY_COMMAND",
+            pending_since=utcnow(),
         )
         self.db.add(task)
         for index, step in enumerate(payload.steps, start=1):
@@ -166,6 +167,20 @@ class TaskService:
             else:
                 if device.revoked_at is not None:
                     problems.append(f"target device is revoked: {payload.target_device_id}")
+
+        # V1.5 §15: validate input artifact references exist (blob health is
+        # re-checked by the Worker at download time - ARTIFACT_NOT_FOUND there).
+        input_artifacts: list[dict] = []
+        from app.artifact.service import ArtifactNotFound, ArtifactService
+
+        artifact_service = ArtifactService(self.db)
+        for ref in payload.input_artifacts:
+            try:
+                artifact_service.get_artifact(ref.artifact_id)
+            except ArtifactNotFound:
+                problems.append(f"input artifact not found: {ref.artifact_id} (role {ref.role})")
+                continue
+            input_artifacts.append({"artifact_id": ref.artifact_id, "role": ref.role})
         if problems or capability_step is None:
             raise TaskValidationFailed(problems or ["capability step missing"])
 
@@ -182,7 +197,9 @@ class TaskService:
             execution_type="CAPABILITY",
             capability_name=capability.name,
             capability_version=payload.capability_version,
-            artifact_ids=[],
+            artifact_ids=input_artifacts,
+            timeout_seconds=payload.timeout_seconds,
+            pending_since=utcnow(),
         )
         self.db.add(task)
         self.db.add(
@@ -357,6 +374,19 @@ class TaskService:
             self._record(task_id, "task.running", step_id=step_id, attempt_id=attempt_id)
 
         elif msg_type == "task.progress":
+            # Phase 8: monotonic progress - the attempt stores the LATEST
+            # snapshot; a stale/reordered event (seq <= stored) never moves it
+            # backwards. Legacy workers send no seq: payload-only updates.
+            seq = data.get("seq")
+            current_seq = attempt.progress_seq if attempt is not None else None
+            if attempt is not None and (seq is None or current_seq is None or seq > current_seq):
+                attempt.progress_seq = seq if seq is not None else (current_seq or 0)
+                attempt.progress_json = {
+                    "progress": data.get("progress"),
+                    "message": data.get("message"),
+                    "seq": seq if seq is not None else current_seq or 0,
+                    "updated_at": now.isoformat(),
+                }
             self._record(
                 task_id,
                 "task.progress",
@@ -466,6 +496,8 @@ class TaskService:
         task.finished_at = now
         self._record(task_id, "task.cancelled", payload={"by": "admin"})
         self.db.commit()
+        # Phase 3: CANCELLED is terminal - the notification layer must see it.
+        notify_task_terminal(task_id)
         return {"task_id": task_id, "status": task.status, "notify_device": task.status == "CANCELLED"}
 
     def request_retry(self, task_id: str) -> dict:
@@ -494,6 +526,8 @@ class TaskService:
         task.status = "PENDING"
         task.finished_at = None
         task.timeout_at = None
+        # Phase 2: fresh offline-max-wait window for the new PENDING stint.
+        task.pending_since = utcnow()
         self._record(task_id, "task.retry_requested", step_id=step.step_id)
         self.db.commit()
         return {"task_id": task_id, "status": task.status}
@@ -567,6 +601,80 @@ class TaskService:
             if open_attempt is not None and open_attempt.status in LIVE_ATTEMPT_STATES:
                 return open_attempt.attempt_id, step.step_id
         return None, None
+
+    def reconcile_terminal_attempts(self, resend_window_seconds: int) -> list[dict]:
+        """Phase 2 reconciliation: an attempt may never outlive its task.
+
+        Called every monitor sweep. Three situations are repaired here:
+
+        1. Superseded attempt (step.current_attempt_id points elsewhere):
+           closed STALE immediately - it is no longer the execution context.
+        2. Terminal task + live attempt, resend window NOT elapsed: the device
+           gets a (re-)sent stop instruction - the original cancel/timeout may
+           have been undeliverable (device offline). The caller dedupes sends.
+        3. Terminal task + live attempt past the resend window: the device is
+           unreachable - the attempt is closed STALE so neither the DB nor the
+           dashboard shows a RUNNING attempt under a terminal task forever.
+
+        Returns the (re-)send actions for case 2:
+        [{task_id, attempt_id, step_id, device_id}]."""
+        now = utcnow()
+        actions: list[dict] = []
+        live_attempts = list(
+            self.db.scalars(
+                select(TaskAttempt).where(TaskAttempt.status.in_(LIVE_ATTEMPT_STATES))
+            )
+        )
+        for attempt in live_attempts:
+            task = self.db.scalars(
+                select(Task).where(Task.task_id == attempt.task_id)
+            ).first()
+            if task is None:
+                continue
+            step = self.db.scalars(
+                select(TaskStep).where(TaskStep.step_id == attempt.step_id)
+            ).first()
+
+            # 1. superseded by a newer attempt on the same step
+            if step is not None and step.current_attempt_id not in (None, attempt.attempt_id):
+                attempt.status = "STALE"
+                attempt.finished_at = now
+                self._record(
+                    attempt.task_id, "task.attempt_reconciled",
+                    step_id=attempt.step_id, attempt_id=attempt.attempt_id,
+                    payload={"reason": "superseded"},
+                )
+                continue
+
+            if task.status not in TERMINAL_TASK_STATES:
+                continue
+
+            # 2/3. terminal task with a live attempt
+            finished_at = task.finished_at or now
+            elapsed = (now - finished_at).total_seconds()
+            if elapsed <= resend_window_seconds:
+                actions.append(
+                    {
+                        "task_id": attempt.task_id,
+                        "attempt_id": attempt.attempt_id,
+                        "step_id": attempt.step_id,
+                        "device_id": attempt.device_id,
+                    }
+                )
+            else:
+                attempt.status = "STALE"
+                attempt.finished_at = now
+                attempt.error_code = attempt.error_code or "ATTEMPT_STALE"
+                attempt.error_message = (
+                    f"attempt outlived its {task.status} task; stop delivery unconfirmed"
+                )
+                self._record(
+                    attempt.task_id, "task.attempt_reconciled",
+                    step_id=attempt.step_id, attempt_id=attempt.attempt_id,
+                    payload={"reason": "terminal_task", "task_status": task.status},
+                )
+        self.db.commit()
+        return actions
 
     # ------------------------------------------------------------------ helpers
 

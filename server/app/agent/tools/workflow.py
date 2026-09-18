@@ -69,9 +69,9 @@ async def _wait_run_terminal(run_id: str, timeout: float) -> str | None:
             if time.monotonic() > deadline:
                 return status  # still RUNNING/PENDING: report, don't lie
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(event.wait()), timeout=settings.agent_poll_interval * 5
-                )
+                # Phase 5: no shield (see task._wait_terminal) - a shielded
+                # waiter leaks one pending Task per poll round.
+                await asyncio.wait_for(event.wait(), timeout=settings.agent_poll_interval * 5)
             except asyncio.TimeoutError:
                 continue
     finally:

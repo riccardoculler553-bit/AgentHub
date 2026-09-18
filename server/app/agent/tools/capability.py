@@ -13,10 +13,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agent.tools.base import AgentTool, EmptyArgs, RiskLevel, ToolResult
+from app.agent.tools.context import current_run_id
 from app.agent.tools.registry import ToolRegistry
 from app.capability_runtime.errors import CapabilityError
 from app.capability_runtime.service import CapabilityService
 from app.core.config import settings
+from app.db.database import SessionLocal
 from app.task.models import TaskCreateIn, StepIn
 
 
@@ -37,7 +39,28 @@ class RunCapabilityArgs(BaseModel):
         default=None, max_length=32,
         description="固定版本（semver）；不指定则使用当前 PUBLISHED 版本",
     )
-    params: dict = Field(default_factory=dict, description="Capability 入参，与 manifest.inputs 对应")
+    device: str | None = Field(
+        default=None, max_length=128,
+        description="目标设备（设备名称或 device_id，如 办公室电脑02）；不指定则由平台自动选择 Worker",
+    )
+    # V1.5 §11/§15: manifest input name -> input artifact ids（数据经 Artifact
+    # 平面传输，Task 只保存引用；如 {"data_dir": ["art_x"], "mapping_dir": ["art_y"]}）
+    inputs: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="输入 Artifact 引用：manifest.inputs 中的输入名 -> artifact_id 列表",
+    )
+    # V1.5: 大任务超时覆盖（秒）。大数据处理任务建议显式给大值，如 7200。
+    timeout_seconds: int | None = Field(
+        default=None, ge=60, le=86400,
+        description="任务超时秒数（60~86400）；不填用平台默认 1800。大文件任务建议 7200",
+    )
+    params: dict = Field(default_factory=dict, description="Capability 其他入参，与 manifest.inputs 对应")
+    # Phase 4: 默认异步——创建任务立即返回 CONFIGURED，终态由通知层主动推送；
+    # wait=True 保留旧的同步等待语义（等待上限 agent_tool_wait_max）。
+    wait: bool = Field(
+        default=False,
+        description="是否同步等待任务终态。默认 False：立即返回 task_id（CONFIGURED），完成后主动通知",
+    )
 
 
 def _capability_out(row) -> dict:
@@ -88,7 +111,27 @@ def register_capability_tools(registry: ToolRegistry, hub: Any = None) -> None:
     async def run_capability(db: Session, args: dict) -> ToolResult:
         from app.task.dispatcher import TaskDispatcher
         from app.task.errors import TaskError
+        from app.task.models import InputArtifactIn
         from app.task.service import TaskService
+
+        # V1.5 §11: resolve the device NAME the user speaks into a real
+        # device_id - worker names never leak into the execution layer.
+        target_device_id = None
+        device_name = (args.get("device") or "").strip()
+        if device_name:
+            from app.agent.tools.device import _resolve_device
+
+            device, err = _resolve_device(db, device_name)
+            if err is not None:
+                return err
+            target_device_id = device.device_id
+
+        # V1.5 §15: artifact references (role = manifest input name).
+        input_artifacts = [
+            InputArtifactIn(artifact_id=artifact_id, role=role)
+            for role, ids in (args.get("inputs") or {}).items()
+            for artifact_id in (ids or [])
+        ]
 
         try:
             task = TaskService(db).create(
@@ -97,6 +140,9 @@ def register_capability_tools(registry: ToolRegistry, hub: Any = None) -> None:
                     steps=[StepIn(command=args["capability"], params=args.get("params") or {})],
                     execution_type="CAPABILITY",
                     capability_version=args.get("version"),
+                    target_device_id=target_device_id,
+                    input_artifacts=input_artifacts,
+                    timeout_seconds=args.get("timeout_seconds"),
                     source_type="AGENT",
                 ),
                 created_by="tool_agent",
@@ -105,12 +151,34 @@ def register_capability_tools(registry: ToolRegistry, hub: Any = None) -> None:
             return ToolResult.fail(exc.code.upper(), str(exc))
         if hub is not None:
             await TaskDispatcher(hub).dispatch_task(task.task_id)
+        # Phase 3: link Task -> AgentRun so the terminal notification can find
+        # the conversation even after this run has finished (best-effort).
+        run_id = current_run_id.get()
+        if run_id:
+            try:
+                from app.agent.runs import AgentRunService
+
+                AgentRunService(SessionLocal()).set_task(
+                    run_id, task.task_id, ack_reply=f"已创建任务 {task.task_id}"
+                )
+            except Exception:  # noqa: BLE001 - notification link is best-effort
+                pass
+        # Phase 4: default async - the Tool Loop must not pay for long waits.
+        if not args.get("wait"):
+            return ToolResult.ok(
+                {
+                    "task_id": task.task_id,
+                    "capability": task.capability_name,
+                    "version": task.capability_version,
+                    "status": "CONFIGURED",
+                    "note": "任务已配置并派发；执行完成后会主动通知结果与产物清单，"
+                            "期间可用 get_task_detail 查询进度。",
+                }
+            )
         # waits_task: reuse the task _wait_terminal helper (§44 internal wait).
         from app.agent.tools.task import _wait_terminal
 
         status, result = await _wait_terminal(task.task_id, settings.agent_tool_wait_max)
-        from app.db.database import SessionLocal
-
         with SessionLocal() as fresh_db:
             artifacts = _task_artifacts(fresh_db, task.task_id)
         data = {
@@ -148,7 +216,9 @@ def register_capability_tools(registry: ToolRegistry, hub: Any = None) -> None:
     registry.register(
         AgentTool(
             name="run_capability",
-            description="执行一个自动化能力（由平台自动选择 Worker 并按需拉取程序包），等待执行结束返回结果与产物列表。需要用户确认。",
+            description="执行一个自动化能力（由平台自动选择 Worker 并按需拉取程序包）。"
+                        "默认立即返回 task_id（状态 CONFIGURED），任务完成后主动推送结果与产物；"
+                        "需要同步拿到结果时传 wait=true（等待上限受平台限制）。需要用户确认。",
             handler=run_capability,
             args_schema=RunCapabilityArgs,
             risk_level=RiskLevel.ACTION,

@@ -112,6 +112,12 @@ def build_nodes(runner: Any, policy: Any) -> dict[str, Any]:
             "tool_result": result.model_dump(),
             "tool_call_count": state.get("tool_call_count", 0) + 1,
         }
+        # V1.5: waits_task 工具会阻塞到业务任务终态（能力任务常达数分钟）——
+        # 这段等待不能消耗 LLM 循环预算，否则任何长任务都会被 AGENT_TIMEOUT
+        # 误报为"超时"，任务的真实成败永远到不了用户（2026-09-14 实测）。
+        tool = runner.registry.get(state.get("tool_name") or "")
+        if tool is not None and getattr(tool, "waits_task", False):
+            update["started_at"] = time.monotonic()
         # PDF §57: the user must answer before a confirmation-gated tool runs;
         # park the pending call in the context so resume can re-execute it.
         if result.error_code == ToolErrorCodes.CONFIRMATION_REQUIRED:
@@ -188,7 +194,11 @@ def build_nodes(runner: Any, policy: Any) -> dict[str, Any]:
                     "请把需求拆小一点再试，或直接在控制台查看设备与任务状态。"
                 }
             if code == AGENT_TIMEOUT:
-                return {"reply": "处理超时，请稍后再试或把需求拆小一点。"}
+                return {
+                    "reply": "本轮等待超时。注意：已派发的任务不会因此中断，"
+                    "会继续在后台执行——你可以说「查一下 task_xxx 的状态」让我查询，"
+                    "或在控制台「任务」页查看结果。"
+                }
             return {"reply": f"处理未完成：{error.get('message') or code or '未知错误'}"}
 
         answer = state.get("final_answer")
