@@ -14,7 +14,7 @@ Internet ──HTTPS/WSS──> 公网暴露层 ──> DeviceLink/AgentHub Serv
 
 详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-**v1.6 产品方向**（设计文档，非实现）：可售卖的多设备 Agent **执行平面**（注册/标签/调度/可观测/可计量），不是 Python 常驻进程产品。长驻脚本只是 P1 的一条工作流。见 [docs/v1.6-product-roadmap.md](docs/v1.6-product-roadmap.md)。
+**V1.6 产品方向**（设计文档，非实现）：**Fleet Execution & Operationalization（多设备执行与运行管理）**——把多台真实办公 PC 管成可调用的可靠执行池。硬规则：一次用户请求 → 一次 Capability Execution → 一个 Task → 一台 Worker。不是 SaaS 多租户 / 计费 / Job 扇出产品。见 [docs/v1.6-product-roadmap.md](docs/v1.6-product-roadmap.md)。
 
 ## 网络模型（核心架构原则）
 

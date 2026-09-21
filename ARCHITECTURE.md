@@ -3,7 +3,7 @@
 > 版本：AgentHub V1.5 Remote-Exec-1.0 + V1.3 Workflow Engine + V1.2 Tool-Using Agent + V1.1 Reliable-1.0 + MVP-Real-1.0 + Routing-1.0（底层 DeviceLink V1.0 已含 2026-09-05 公网架构调整）· 更新日期：2026-09-12
 > 测试基线：`pytest tests/`（排除已知挂起的 test_capability_acceptance.py，技术债）→ **299 passed**
 > 里程碑：**MVP 已全链路实机跑通**（§16）；**V1.1 可靠性执行落地**（§17）；**V1.2 Tool-Using Agent 落地**（§18）；**V1.3 Workflow Engine 落地**（§19）；**V1.4 Capability Runtime + V1.5 远程执行落地**（能力包/Artifact 数据平面/输入链路/Python venv Runtime/Workspace，首个真实能力 data.excel.preprocess 实机验收通过，见 §20）。
-> **v1.6 产品路线（设计）**：[docs/v1.6-product-roadmap.md](docs/v1.6-product-roadmap.md)。本文档仍是 V1.5 实现快照。
+> **V1.6 产品路线（设计）**：[docs/v1.6-product-roadmap.md](docs/v1.6-product-roadmap.md)（Fleet Execution：多设备执行与运行管理；非 SaaS/计费/Job 扇出）。本文档仍是 V1.5 实现快照。
 
 AgentHub 是构建在 DeviceLink（多设备 WebSocket 注册与连接管理平台）之上的**任务控制与智能编排层**：Admin/主 Agent 把自然语言或结构化请求转化为任务（Task），经命令注册表（Command Registry）与能力注册表（Capability Registry）双重校验后，通过 DeviceLink 长连接派发到指定子电脑的 Worker 执行，回报结果、支持多步串行、自动重试、超时看门狗、取消与离线重派。
 
