@@ -17,3 +17,4 @@ client.zip
 .pytest_client/
 worker.db
 server/storage/
+.workbuddy/
