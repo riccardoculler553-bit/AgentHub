@@ -14,7 +14,7 @@ Internet ──HTTPS/WSS──> 公网暴露层 ──> DeviceLink/AgentHub Serv
 
 详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-**v1.6 产品方向**（设计文档，非实现）：把 AgentHub 做成可运营的产品服务（设备舰队、能力目录、运行历史、告警、安全默认、10 分钟接入），长驻 Python 进程只是其中一条工作流。见 [docs/v1.6-product-roadmap.md](docs/v1.6-product-roadmap.md)。
+**v1.6 产品方向**（设计文档，非实现）：可售卖的多设备 Agent **执行平面**（注册/标签/调度/可观测/可计量），不是 Python 常驻进程产品。长驻脚本只是 P1 的一条工作流。见 [docs/v1.6-product-roadmap.md](docs/v1.6-product-roadmap.md)。
 
 ## 网络模型（核心架构原则）
 
