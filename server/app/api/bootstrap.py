@@ -149,6 +149,45 @@ def download_worker_bundle():
     )
 
 
+@router.get("/bootstrap/python-runtime", dependencies=[Depends(require_admin)])
+def download_python_runtime():
+    """Serve the Python installer the admin staged for fresh machines that
+    have no Python at all (bootstrap.bat downloads it from here in LAN mode).
+
+    Drop ONE installer file (e.g. python-3.11.9-amd64.exe or the embeddable
+    zip) into  <storage>/bootstrap/python/  - the endpoint serves it with a
+    checksum header so bootstrap.bat can verify the download."""
+    py_dir = settings.storage_dir / "bootstrap" / "python"
+    if not py_dir.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "python_runtime_missing",
+                "message": (
+                    "no python runtime staged; ask the admin to place an installer "
+                    f"at {py_dir} (python-3.11.9-amd64.exe recommended)"
+                ),
+            },
+        )
+    candidates = sorted(
+        p for p in py_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".exe", ".zip") and not p.name.startswith(".")
+    )
+    if not candidates:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "python_runtime_missing", "message": f"no .exe/.zip installer found in {py_dir}"},
+        )
+    dest = candidates[0]
+    media = "application/zip" if dest.suffix.lower() == ".zip" else "application/octet-stream"
+    return FileResponse(
+        dest,
+        media_type=media,
+        filename=dest.name,
+        headers={"X-Checksum": _sha256_file(dest)},
+    )
+
+
 @router.post(
     "/device-enrollment/tokens",
     response_model=EnrollmentTokenOut,

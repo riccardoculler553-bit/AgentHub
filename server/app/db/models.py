@@ -56,6 +56,9 @@ class DeviceRegistrationCode(Base):
     registration_id: Mapped[str] = mapped_column(CHAR(36), unique=True)
     code_hash: Mapped[str] = mapped_column(String(128), unique=True)
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # V1.7: operator-assigned device name rides with the code; register
+    # falls back to it when the client sends an empty device_name.
+    device_name: Mapped[str] = mapped_column(String(100), default="")
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

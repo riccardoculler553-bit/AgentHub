@@ -220,18 +220,43 @@ class ArtifactService:
         self.db.delete(row)
         self.db.commit()
 
+    def count_artifacts(
+        self,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        search: str | None = None,
+    ) -> int:
+        """Total rows for the list filter (dashboard pagination, V1.7)."""
+        from sqlalchemy import func
+
+        stmt = select(func.count()).select_from(Artifact)
+        if task_id:
+            stmt = stmt.where(Artifact.task_id == task_id)
+        if workflow_run_id:
+            stmt = stmt.where(Artifact.workflow_run_id == workflow_run_id)
+        if search:
+            stmt = stmt.where(_artifact_search_filter(search))
+        return int(self.db.scalar(stmt) or 0)
+
     def list_artifacts(
         self,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         limit: int = 100,
+        offset: int = 0,
+        search: str | None = None,
     ) -> list[Artifact]:
         stmt = select(Artifact).order_by(Artifact.id.desc()).limit(max(1, min(limit, 500)))
+        if offset > 0:
+            stmt = stmt.offset(offset)
         if task_id:
             stmt = stmt.where(Artifact.task_id == task_id)
         if workflow_run_id:
             stmt = stmt.where(Artifact.workflow_run_id == workflow_run_id)
+        if search:
+            stmt = stmt.where(_artifact_search_filter(search))
         return list(self.db.scalars(stmt))
+
 
     def purge_expired(self, now: datetime | None = None) -> int:
         """Best-effort sweep for expired artifacts (lifecycle control, §64)."""
@@ -246,3 +271,15 @@ class ArtifactService:
                 except ArtifactNotFound:
                     pass
         return removed
+
+
+def _artifact_search_filter(search: str):
+    """Dashboard search: matches artifact id, name or source task id."""
+    from sqlalchemy import or_
+
+    like = f"%{search.strip()}%"
+    return or_(
+        Artifact.artifact_id.ilike(like),
+        Artifact.name.ilike(like),
+        Artifact.task_id.ilike(like),
+    )

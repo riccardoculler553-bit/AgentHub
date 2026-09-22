@@ -183,8 +183,12 @@
 
   <div class="section-title">已注册 Artifact（最近 50 条）</div>
   <div class="toolbar">
-    <button class="ghost" onclick="refreshArtifacts()">刷新</button>
-    <span class="muted">派发任务时把 Artifact ID 填入 inputs（role = 能力 manifest 的输入名）</span>
+    <input type="text" id="artSearch" placeholder="搜索：Artifact ID / 名称 / 任务ID" style="min-width:260px"
+           onkeydown="if(event.key==='Enter'){artOffset=0;refreshArtifacts();}">
+    <button class="ghost" onclick="artOffset=0;refreshArtifacts()">搜索 / 刷新</button>
+    <button class="ghost" onclick="artPrev()">上一页</button>
+    <button class="ghost" onclick="artNext()">下一页</button>
+    <span class="muted" id="artPageInfo"></span>
   </div>
   <table>
     <thead><tr><th>Artifact ID</th><th>名称</th><th>大小</th><th>来源任务</th><th>注册时间</th><th>操作</th></tr></thead>
@@ -674,12 +678,25 @@ function copyArt(id) {
   );
 }
 
+/* V1.7: artifact 分页状态（每页 20 条，服务端 offset + X-Total-Count） */
+let artOffset = 0;
+const ART_PAGE = 20;
+
 async function refreshArtifacts() {
   const tbody = document.getElementById("artRows");
   try {
-    const rows = await api("/api/artifacts?limit=50").then(r => r.json());
+    const search = (document.getElementById("artSearch").value || "").trim();
+    const qs = `?limit=${ART_PAGE}&offset=${artOffset}` +
+               (search ? `&search=${encodeURIComponent(search)}` : "");
+    const res = await api("/api/artifacts" + qs);
+    const rows = await res.json();
+    const total = Number(res.headers.get("X-Total-Count") || rows.length);
+    const page = Math.floor(artOffset / ART_PAGE) + 1;
+    const pages = Math.max(1, Math.ceil(total / ART_PAGE));
+    document.getElementById("artPageInfo").textContent =
+      `共 ${total} 条 · 第 ${page}/${pages} 页`;
     if (!rows.length) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty">还没有 Artifact，先扫描目录上传</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">没有匹配的 Artifact（调整搜索词或翻页）</td></tr>';
       return;
     }
     tbody.innerHTML = rows.map(a => `
@@ -692,11 +709,26 @@ async function refreshArtifacts() {
         <td class="actions">
           <button class="ghost" onclick="copyArt('${a.artifact_id}')">复制ID</button>
           <button class="ghost" onclick="downloadArt('${a.artifact_id}','${esc(a.name)}')">下载</button>
+          <button class="danger" onclick="deleteArt('${a.artifact_id}','${esc(a.name)}')">删除</button>
         </td>
       </tr>`).join("");
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="6" class="empty">${esc(e.message)}</td></tr>`;
   }
+}
+function artPrev() { artOffset = Math.max(0, artOffset - ART_PAGE); refreshArtifacts(); }
+function artNext() { artOffset += ART_PAGE; refreshArtifacts(); }
+
+async function deleteArt(id, name) {
+  if (!confirm(`删除 Artifact ${name}（${id.slice(0, 14)}…）？\n元数据与存储文件都会移除，引用它的历史任务无法再下载。`)) return;
+  try {
+    const res = await api(`/api/artifacts/${id}`, { method: "DELETE" });
+    if (!res.ok && res.status !== 204) {
+      alert("删除失败: HTTP " + res.status + " " + (await res.text()));
+      return;
+    }
+  } catch (e) { alert(e.message); return; }
+  refreshArtifacts();
 }
 
 async function downloadArt(id, name) {

@@ -377,6 +377,40 @@ def test_download_acl_binds_task_artifacts_to_target_worker(client):
     assert res.json()["detail"]["code"] == "artifact_forbidden"
 
 
+def test_artifact_list_pagination_search_and_delete(client):
+    """V1.7 dashboard UX: X-Total-Count paging + search (id/name/task) +
+    admin delete removes metadata (blob row gone from the list)."""
+    device = register_device(client, "分页测试机")
+    token = device["device_token"]
+    for i in range(7):
+        _upload_input_artifact(client, token, f"batch_{i}.xlsx", b"X" * 10, task_id=f"task_page_{i}")
+
+    # search narrows to the matching name and reports the true total
+    res = client.get("/api/artifacts?search=batch_&limit=20")
+    assert res.status_code == 200
+    assert res.headers["X-Total-Count"] == "7"
+
+    # pagination: limit=3 page 1 vs page 2 differ, total stays 7
+    page1 = client.get("/api/artifacts?search=batch_&limit=3&offset=0")
+    page2 = client.get("/api/artifacts?search=batch_&limit=3&offset=3")
+    ids1 = {a["artifact_id"] for a in page1.json()}
+    ids2 = {a["artifact_id"] for a in page2.json()}
+    assert len(page1.json()) == 3 and len(page2.json()) == 3
+    assert not (ids1 & ids2)
+    assert page1.headers["X-Total-Count"] == "7"
+
+    # search also matches the task id
+    res = client.get("/api/artifacts?search=task_page_3&limit=20")
+    assert len(res.json()) == 1
+
+    # delete removes the artifact from the list and the total
+    victim = page1.json()[0]["artifact_id"]
+    assert client.delete(f"/api/artifacts/{victim}").status_code == 204
+    res = client.get("/api/artifacts?search=batch_&limit=20")
+    assert res.headers["X-Total-Count"] == "6"
+    assert victim not in {a["artifact_id"] for a in res.json()}
+
+
 def test_dispatch_carries_input_artifacts(client):
     """§26: task.input_artifacts -> WebSocket capability.execute references."""
     _publish_capability(client)

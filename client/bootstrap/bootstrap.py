@@ -72,11 +72,14 @@ def _registration_error(exc: urllib.error.HTTPError) -> BootstrapError:
 
 
 def register_device(server_url: str, token: str, device_name: str | None = None) -> dict:
-    """POST /api/devices/register. Returns {"device_id", "device_token"}."""
+    """POST /api/devices/register. Returns {"device_id", "device_token"}.
+
+    Naming chain (V1.7): --device-name -> the name the operator assigned to
+    the enrollment code (server-side fallback) -> this machine's hostname."""
     body = json.dumps(
         {
             "registration_code": token.strip().upper(),
-            "device_name": device_name or "",
+            "device_name": device_name or socket.gethostname(),
             "hostname": socket.gethostname(),
             "platform": platform.system().lower() or "unknown",
             "client_version": BOOTSTRAP_CLIENT_VERSION,

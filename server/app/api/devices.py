@@ -45,15 +45,18 @@ def _to_http_error(exc: DeviceLinkError) -> HTTPException:
 
 @router.post("/devices/register", response_model=DeviceRegisterOut, status_code=status.HTTP_201_CREATED)
 def register_device(payload: DeviceRegisterIn, db: Session = Depends(get_db)):
-    """One-time registration: consume code -> create device -> issue token."""
+    """One-time registration: consume code -> create device -> issue token.
+
+    V1.7 naming: the effective device name is payload.device_name, falling
+    back to the name the operator assigned when creating the code."""
     from app.api.registration import get_or_create_default_user
 
     try:
-        user = get_or_create_default_user(db)
         code_row = RegistrationService(db).consume_code(payload.registration_code)
+        effective_name = (payload.device_name or "").strip() or code_row.device_name
         device = DeviceService(db).create_device(
-            user_id=code_row.user_id or user.id,
-            name=payload.device_name or f"device-{device_uuid_suffix()}",
+            user_id=code_row.user_id or get_or_create_default_user(db).id,
+            name=effective_name or f"device-{device_uuid_suffix()}",
             hostname=payload.hostname,
             platform=payload.platform,
             client_version=payload.client_version,

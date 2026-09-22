@@ -12,7 +12,7 @@ import hmac
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -110,11 +110,25 @@ def list_artifacts(
     task_id: str | None = None,
     workflow_run_id: str | None = None,
     limit: int = 100,
+    offset: int = 0,
+    search: str | None = None,
+    response: Response = None,
     db: Session = Depends(get_db),
 ):
+    """Artifact list with V1.7 dashboard paging: `search` matches artifact
+    id / name / task id; the total row count rides in X-Total-Count."""
+    service = ArtifactService(db)
+    rows = service.list_artifacts(
+        task_id=task_id, workflow_run_id=workflow_run_id,
+        limit=limit, offset=max(0, offset), search=search,
+    )
+    if response is not None:
+        response.headers["X-Total-Count"] = str(
+            service.count_artifacts(task_id=task_id, workflow_run_id=workflow_run_id, search=search)
+        )
     return [
         _artifact_out(a)
-        for a in ArtifactService(db).list_artifacts(task_id=task_id, workflow_run_id=workflow_run_id, limit=limit)
+        for a in rows
     ]
 
 

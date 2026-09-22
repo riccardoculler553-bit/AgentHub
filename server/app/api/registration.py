@@ -28,6 +28,6 @@ def get_or_create_default_user(db: Session) -> User:
 def create_registration_code(payload: CreateRegistrationCodeIn, db: Session = Depends(get_db)):
     user = get_or_create_default_user(db)
     service = RegistrationService(db)
-    row, plaintext = service.create_code(user_id=user.id)
+    row, plaintext = service.create_code(user_id=user.id, device_name=payload.device_name)
     db.commit()
     return RegistrationCodeOut(registration_id=row.registration_id, code=plaintext, expires_at=row.expires_at)

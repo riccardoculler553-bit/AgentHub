@@ -346,6 +346,30 @@ def test_rbac_role_tokens_are_hierarchical(client, monkeypatch):
     assert res.status_code == 200
 
 
+def test_registration_code_carries_device_name(client):
+    """V1.7: the operator-assigned name rides with the enrollment code and is
+    used when the client registers without a device_name."""
+    code_res = client.post("/api/device-registration", json={"device_name": "财务电脑07"})
+    assert code_res.status_code == 201
+    code = code_res.json()["code"]
+
+    res = client.post(
+        "/api/devices/register",
+        json={
+            "registration_code": code,
+            "device_name": "",  # client sent nothing
+            "hostname": "FIN-PC-07",
+            "platform": "windows",
+            "client_version": "1.7.0",
+        },
+    )
+    assert res.status_code == 201, res.text
+    device_id = res.json()["device_id"]
+    listing = client.get("/api/devices").json()
+    device = next(d for d in listing if d["device_id"] == device_id)
+    assert device["name"] == "财务电脑07"
+
+
 # ---------------------------------------------------- §38 多连接聚合在线
 
 

@@ -16,13 +16,16 @@ class RegistrationService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def create_code(self, user_id: int) -> tuple[DeviceRegistrationCode, str]:
-        """Create a one-time code. Returns (row, plaintext_code) - plaintext is shown once."""
+    def create_code(self, user_id: int, device_name: str = "") -> tuple[DeviceRegistrationCode, str]:
+        """Create a one-time code. Returns (row, plaintext_code) - plaintext is shown once.
+        The operator-assigned device_name rides with the code (V1.7): register
+        falls back to it when the client sends an empty device_name."""
         code = generate_registration_code()
         row = DeviceRegistrationCode(
             registration_id=str(uuid.uuid4()),
             code_hash=hash_token(code),
             user_id=user_id,
+            device_name=(device_name or "").strip()[:100],
             expires_at=utcnow() + timedelta(seconds=settings.registration_code_ttl),
             created_at=utcnow(),
         )
