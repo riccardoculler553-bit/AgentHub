@@ -15,6 +15,8 @@ from app.api import agent as agent_api
 from app.api import workflows as workflows_api
 from app.api import capability as capability_api
 from app.api import artifact as artifact_api
+from app.api import bootstrap as bootstrap_api
+from app.api import processes as processes_api
 from app.command.db_models import Command  # noqa: F401 - AgentHub tables
 from app.agent.db_models import AgentRun  # noqa: F401 - MVP agent_runs table
 from app.command.service import CommandService
@@ -33,6 +35,7 @@ from app.capability_runtime.db_models import (  # noqa: F401 - V1.4 Capability R
 )
 from app.artifact.db_models import Artifact  # noqa: F401 - V1.4 Artifact plane
 from app.task.db_models import Task, TaskAttempt, TaskEvent, TaskStep  # noqa: F401
+from app.worker.db_models import WorkerEnvironment, WorkerProcess  # noqa: F401 - V1.7 Worker plane
 from app.task.events import subscribe_task_terminal
 from app.task.monitor import TaskMonitor
 from app.websocket.heartbeat import HeartbeatMonitor
@@ -153,6 +156,10 @@ def create_app() -> FastAPI:
     app.include_router(artifact_api.upload_router)
     app.include_router(artifact_api.download_router)
     app.include_router(artifact_api.admin_router)
+    # V1.7 Bootstrap plane (§15-§20, §64)
+    app.include_router(bootstrap_api.router)
+    # V1.7 persistent-process plane
+    app.include_router(processes_api.router)
 
     @app.get("/", include_in_schema=False)
     async def dashboard():

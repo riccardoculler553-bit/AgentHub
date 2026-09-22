@@ -118,6 +118,7 @@ class CapabilityService:
         input_schema: dict | None = None,
         output_schema: dict | None = None,
         checksum: str = "",
+        config: dict | None = None,
     ) -> CapabilityVersion:
         """Create an immutable DRAFT version. Rejects duplicates (§9)."""
         self.require_capability(name)
@@ -129,6 +130,7 @@ class CapabilityService:
             version=version,
             package_id=package_id,
             status="DRAFT",
+            config=config or {},
             entrypoint=entrypoint,
             input_schema=input_schema or {},
             output_schema=output_schema or {},

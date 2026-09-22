@@ -57,6 +57,9 @@ class CapabilityVersion(Base):
     output_schema: Mapped[dict] = mapped_column(JSON, default=dict)
     entrypoint: Mapped[str] = mapped_column(String(200), default="main")
     checksum: Mapped[str] = mapped_column(String(128), default="")
+    # V1.7: merged manifest.config (agenthub.yaml blocks incl. execution/
+    # workspace/resources/restart) - the resolver and API read it server-side.
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

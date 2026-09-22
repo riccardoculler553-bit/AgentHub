@@ -199,6 +199,7 @@ async def upload_version(name: str, file: UploadFile = File(...), db: Session = 
             input_schema=manifest.inputs,
             output_schema=manifest.outputs,
             checksum=package.checksum,
+            config=manifest.config,
         )
     except CapabilityError as exc:
         raise _capability_error(exc) from exc

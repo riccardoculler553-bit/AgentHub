@@ -101,6 +101,32 @@ def get_device(device_id: str, request: Request, db: Session = Depends(get_db)):
     )
 
 
+@router.get("/devices/{device_id}/environment", dependencies=[Depends(require_viewer)])
+def get_device_environment(device_id: str, db: Session = Depends(get_db)):
+    """V1.7 §22: the device's latest environment snapshot (machine/runtime/
+    automation/worker + fingerprint). 404 when the device never reported."""
+    from app.worker.service import WorkerService
+
+    try:
+        DeviceService(db).get_device(device_id)
+    except DeviceLinkError as exc:
+        raise _to_http_error(exc) from exc
+    row = WorkerService(db).get_environment(device_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "environment_not_reported", "message": "device has not reported an environment yet"},
+        )
+    return {
+        "device_id": row.device_id,
+        "hostname": row.hostname,
+        "worker_version": row.worker_version,
+        "fingerprint": row.fingerprint,
+        "collected_at": row.collected_at,
+        "environment": row.snapshot,
+    }
+
+
 @router.post("/devices/{device_id}/revoke", response_model=DeviceOut, dependencies=[Depends(require_admin)])
 async def revoke_device(device_id: str, request: Request, db: Session = Depends(get_db)):
     hub = request.app.state.hub

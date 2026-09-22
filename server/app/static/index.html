@@ -310,6 +310,7 @@ async function refreshDevices() {
         <td>${fmtTime(d.last_seen_at)}</td>
         <td class="mono">${esc(d.client_version || "-")}</td>
         <td class="actions">
+          <button class="ghost" onclick="openEnv('${d.device_id}','${esc(d.name)}')">环境</button>
           ${online ? `<button onclick="sendMessage('${d.device_id}','${esc(d.name)}')">发消息</button>` : ""}
           ${d.status !== "revoked" ? `<button class="danger" onclick="revoke('${d.device_id}','${esc(d.name)}')">撤销</button>` : ""}
         </td>
@@ -445,6 +446,43 @@ async function openTask(id) {
   document.getElementById("taskModal").style.display = "block";
 }
 function closeModal() { document.getElementById("taskModal").style.display = "none"; }
+
+/* ============================== 设备环境（V1.7 §22/§27） ============================== */
+async function openEnv(deviceId, name) {
+  let env = null, procs = [];
+  try { env = await api(`/api/devices/${deviceId}/environment`).then(r => r.json()); }
+  catch (e) { /* not reported yet */ }
+  try { procs = await api(`/api/processes?device_id=${encodeURIComponent(deviceId)}`).then(r => r.json()); }
+  catch (e) { /* viewer may lack process list */ }
+
+  const e = env ? env.environment : null;
+  const rows = e ? [
+    ["主机名", env.hostname || e.hostname || "-"],
+    ["操作系统", `${(e.os && e.os.name) || "-"} ${(e.os && e.os.version) || ""}`],
+    ["架构 / CPU", `${e.arch || "-"} · ${e.cpu ? e.cpu.cores : "?"} cores`],
+    ["内存 / 磁盘", `${e.memory ? e.memory.total_gb + " GB" : "-"} · 剩余 ${e.disk ? e.disk.free_gb + " GB" : "-"}`],
+    ["Python", (e.python || []).join(", ") || "-"],
+    ["影刀 RPA", e.yingdao && e.yingdao.installed ? `已安装${e.yingdao.version ? " v" + e.yingdao.version : ""}` : "未检测到"],
+    ["Worker 版本", (e.worker && e.worker.version) || env.worker_version || "-"],
+    ["指纹", `<span class="mono">${esc((env.fingerprint || "-").slice(0, 16))}…</span> @ ${fmtAbs(env.collected_at)}`],
+  ] : [["环境", "该设备尚未上报环境快照（Worker 连接后自动上报）"]];
+
+  const procRows = (procs || []).length ? procs.map(p => `<tr>
+      <td class="mono">${esc(p.process_id.slice(0, 14))}…</td>
+      <td class="mono">${esc(p.capability)}@${esc(p.version)}</td>
+      <td>${badge(p.status)}</td>
+      <td class="mono">${p.pid || "-"}</td>
+      <td class="mono">${p.restart_count}</td>
+    </tr>`).join("") : '<tr><td colspan="5" class="empty">无持久进程</td></tr>';
+
+  document.getElementById("tmTitle").innerHTML = `设备环境 · ${esc(name)}`;
+  document.getElementById("tmBody").innerHTML = `
+    <div class="kv">${rows.map(([k, v]) => `<div class="k">${k}</div><div>${v}</div>`).join("")}</div>
+    <div class="section-title">持久进程（ProcessInstance，V1.7 §11）</div>
+    <table><thead><tr><th>Process</th><th>能力</th><th>状态</th><th>PID</th><th>重启次数</th></tr></thead>
+    <tbody>${procRows}</tbody></table>`;
+  document.getElementById("taskModal").style.display = "block";
+}
 
 /* ============================== 命令 ============================== */
 async function refreshCommands() {

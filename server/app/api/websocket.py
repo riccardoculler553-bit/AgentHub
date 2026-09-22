@@ -181,6 +181,54 @@ async def _dispatch(connection: DeviceConnection, envelope: Envelope) -> None:
         await connection.send(
             Envelope(id=envelope.id, type=MessageType.MESSAGE_ACK, data={"success": True, "stored": count})
         )
+    elif msg_type == MessageType.WORKER_ENVIRONMENT:
+        # V1.7 §22: environment snapshot (machine/runtime/automation/worker)
+        with SessionLocal() as db:
+            from app.worker.service import WorkerService
+
+            svc = WorkerService(db)
+            incoming = envelope.data.get("environment") or {}
+            # drift must be computed BEFORE the upsert overwrites the old fp
+            drifted = (
+                svc.environment_drift(connection.device_id, incoming.get("fingerprint") or "")
+                if incoming.get("fingerprint")
+                else False
+            )
+            row = svc.upsert_environment(connection.device_id, incoming)
+        logger.info(
+            "device %s reported environment (fp=%s%s)",
+            connection.device_id,
+            (row.fingerprint or "-")[:12],
+            ", DRIFT" if drifted else "",
+        )
+        await connection.send(
+            Envelope(id=envelope.id, type=MessageType.MESSAGE_ACK, data={"success": True, "drift": drifted})
+        )
+    elif msg_type == MessageType.PROCESS_STATUS:
+        # V1.7 §12: device reports a persistent process instance transition
+        with SessionLocal() as db:
+            from app.worker.service import WorkerService
+
+            data = envelope.data or {}
+            row = WorkerService(db).update_process_status(
+                str(data.get("process_id", "")),
+                str(data.get("status", "")),
+                pid=data.get("pid"),
+                error=data.get("error"),
+                device_reported=True,
+            )
+        await connection.send(
+            Envelope(id=envelope.id, type=MessageType.MESSAGE_ACK, data={"success": row is not None})
+        )
+    elif msg_type == MessageType.PROCESS_LOG:
+        # V1.7 §12: the device answers a log-tail request (matched by request_id)
+        from app.api.processes import deliver_process_log
+
+        data = envelope.data or {}
+        deliver_process_log(str(data.get("request_id", "")), str(data.get("content", "")))
+        await connection.send(
+            Envelope(id=envelope.id, type=MessageType.MESSAGE_ACK, data={"success": True})
+        )
     elif msg_type in (
         MessageType.TASK_ACCEPT,
         MessageType.TASK_RUNNING,

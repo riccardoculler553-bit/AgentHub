@@ -18,7 +18,14 @@ from sqlalchemy.orm import Session
 
 from app.artifact.service import sha256_file
 from app.capability_runtime.errors import PackageInvalid, PackageNotFound
-from app.capability_runtime.manifest import MANIFEST_FILE, Manifest, parse_manifest_bytes
+from app.capability_runtime.manifest import (
+    AGENTHUB_FILE,
+    Manifest,
+    merge_agenthub,
+    parse_agenthub,
+    parse_manifest_bytes,
+    MANIFEST_FILE,
+)
 from app.capability_runtime.db_models import CapabilityPackage
 from app.core.config import settings
 from app.db.models import utcnow
@@ -143,9 +150,17 @@ def _peek_manifest_from_zipfile(zf: zipfile.ZipFile) -> Manifest:
         raise PackageInvalid(f"missing {MANIFEST_FILE} at the archive root")
     raw = zf.read(MANIFEST_FILE)
     try:
-        return parse_manifest_bytes(raw)
+        manifest = parse_manifest_bytes(raw)
     except ValueError as exc:
         raise PackageInvalid(str(exc)) from exc
+    # V1.7 §3: an optional agenthub.yaml rides along and merges into config
+    if AGENTHUB_FILE in zf.namelist():
+        try:
+            agenthub = parse_agenthub(zf.read(AGENTHUB_FILE))
+            manifest = merge_agenthub(manifest, agenthub)
+        except ValueError as exc:
+            raise PackageInvalid(str(exc)) from exc
+    return manifest
 
 
 def _validate_zip(zip_bytes: bytes, expected_name: str, expected_version: str) -> Manifest:

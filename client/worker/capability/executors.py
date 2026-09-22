@@ -24,7 +24,7 @@ from pathlib import Path
 
 from worker.capability.cache import work_root
 from worker.capability.context import ExecutionContext
-from worker.capability.manifest import Manifest
+from worker.capability.manifest import Manifest, config_entrypoint_command, load_package_config
 from worker.capability.result import CapabilityResult
 from worker.executors.yingdao import YingdaoExecutor
 
@@ -33,6 +33,21 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL = 0.2
 _ENTRY_SAFE = re.compile(r"^[A-Za-z0-9_]+$")
 _HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+
+
+def _entrypoint_args(manifest: Manifest, placeholders: dict[str, str]) -> list[str]:
+    """V1.7 §4/§5: entrypoint.args with ${PLACEHOLDER} substitution - the
+    workspace owns the real paths, the business program never learns about
+    AgentHub (args like --input ${INPUT_DIR} stay readable)."""
+    entrypoint = manifest.config.get("entrypoint") or {}
+    raw_args = entrypoint.get("args") or []
+    resolved: list[str] = []
+    for arg in raw_args:
+        value = str(arg)
+        for name, path in placeholders.items():
+            value = value.replace("${" + name + "}", path)
+        resolved.append(value)
+    return resolved
 
 
 class _EnvironmentError(Exception):
@@ -100,16 +115,33 @@ class PythonCapabilityExecutor(CapabilityExecutor):
         # Structural checks only - the package dir is not known here; the
         # entrypoint file is verified in execute() where the context exists.
         super().validate(manifest, params)
+        command = config_entrypoint_command(manifest.config)
+        if command is not None:
+            # V1.7 §4: entrypoint.command is a relative package path
+            # (business CLI, e.g. main.py or tools/run.py) - never absolute,
+            # never escaping the package.
+            if command.startswith(("/", "\\")) or ".." in command.replace("\\", "/").split("/"):
+                raise ValueError(f"illegal entrypoint.command: {command!r}")
+            return
         if not _ENTRY_SAFE.match(manifest.entrypoint or ""):
             raise ValueError(f"illegal entrypoint: {manifest.entrypoint!r}")
 
     @staticmethod
     def _script_path(manifest: Manifest) -> Path:
+        command = config_entrypoint_command(manifest.config)
+        if command:
+            return Path(command.replace("\\", "/"))
         return Path(str(manifest.entrypoint or "main") + ".py")
 
     async def execute(self, context: ExecutionContext, progress, cancel: asyncio.Event) -> CapabilityResult:
         package_dir = Path(context.package_dir)
-        script = package_dir / self._script_path(context.manifest)
+        # V1.7 §3: merge agenthub.yaml (when present) into the manifest config
+        # - business code + one additive declaration = AgentHub Capability.
+        try:
+            manifest = load_package_config(package_dir, context.manifest)
+        except ValueError as exc:
+            return CapabilityResult.fail("INVALID_PACKAGE", str(exc))
+        script = package_dir / self._script_path(manifest)
         if not script.is_file():
             return CapabilityResult.fail(
                 "INVALID_PACKAGE", f"entrypoint script not found in package: {script.name}"
@@ -126,13 +158,23 @@ class PythonCapabilityExecutor(CapabilityExecutor):
         # workspace owns the paths (and creates them), the capability just
         # consumes them (params[<name>]).
         output_dir = ""
-        for out_name, spec in (context.manifest.outputs or {}).items():
+        for out_name, spec in (manifest.outputs or {}).items():
             if isinstance(spec, dict) and spec.get("type") == "artifact_directory":
                 subdir = Path(str(spec.get("path") or "output")).name
                 out_path = exec_dir / subdir
                 out_path.mkdir(parents=True, exist_ok=True)
                 output_dir = str(out_path)
                 context.params[str(out_name)] = output_dir
+
+        # V1.7 §4: config-driven workspace layout (input/output/log dirs)
+        workspace = manifest.config.get("workspace") or {}
+        input_dir = exec_dir / Path(str(workspace.get("input_dir") or "input")).name
+        input_dir.mkdir(parents=True, exist_ok=True)
+        if not output_dir:
+            output_dir = str(exec_dir / Path(str(workspace.get("output_dir") or "output")).name)
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+        log_dir = exec_dir / Path(str(workspace.get("log_dir") or "logs")).name
+        log_dir.mkdir(parents=True, exist_ok=True)
 
         # Phase 7: context/params persistence is data-plane IO - off the loop.
         await asyncio.to_thread(context.write_context)
@@ -156,6 +198,18 @@ class PythonCapabilityExecutor(CapabilityExecutor):
         )
         if output_dir:
             env["CAPABILITY_OUTPUT_DIR"] = output_dir
+        # V1.7 §4/§5: workspace paths are visible both as env vars and as
+        # ${...} substitutions in entrypoint.args.
+        env.update(
+            INPUT_DIR=str(input_dir),
+            OUTPUT_DIR=str(output_dir),
+            EXECUTION_DIR=str(exec_dir),
+            PACKAGE_DIR=str(package_dir),
+            LOG_DIR=str(log_dir),
+        )
+        agenthub_env = (manifest.config.get("environment") or {}).get("variables") or {}
+        for key, value in agenthub_env.items():
+            env[str(key)] = str(value)
 
         # V1.5 §29: dedicated venv per (capability, version) when the package
         # ships requirements.txt; sys.executable otherwise.
@@ -181,7 +235,13 @@ class PythonCapabilityExecutor(CapabilityExecutor):
                 # the event loop (Windows CreateProcess can take 100ms+).
                 proc = await asyncio.to_thread(
                     subprocess.Popen,
-                    [python_exe, str(script)],
+                    [python_exe, str(script), *_entrypoint_args(manifest, {
+                        "INPUT_DIR": str(input_dir),
+                        "OUTPUT_DIR": str(output_dir),
+                        "EXECUTION_DIR": str(exec_dir),
+                        "PACKAGE_DIR": str(package_dir),
+                        "LOG_DIR": str(log_dir),
+                    })],
                     stdout=out_f,
                     stderr=err_f,
                     text=True,
@@ -251,9 +311,10 @@ class PythonCapabilityExecutor(CapabilityExecutor):
         files = _artifact_files(payload.pop("artifacts", None), exec_dir)
         if not files:
             # V1.5 §35: no explicit artifact list -> scan the declared output
-            # directory (default output/) and upload everything found.
+            # directory (default output/, or the V1.7 workspace.output_dir)
+            # and upload everything found.
             # Phase 7: recursive directory scan runs on a thread.
-            files = await asyncio.to_thread(_scan_output_dirs, exec_dir, context.manifest)
+            files = await asyncio.to_thread(_scan_output_dirs, exec_dir, manifest)
         return CapabilityResult.ok(data=payload, artifact_files=files)
 
     # ------------------------------------------------------------- python env
@@ -399,13 +460,15 @@ def _artifact_files(entries, exec_dir: Path) -> list[tuple[str, Path]]:
 
 def _scan_output_dirs(exec_dir: Path, manifest: Manifest) -> list[tuple[str, Path]]:
     """V1.5 §35: collect every file from the declared artifact_directory
-    outputs (default output/) - the no-result.json fallback."""
+    outputs (default output/, or the V1.7 workspace.output_dir) - the
+    no-result.json fallback."""
     subdirs: list[str] = []
     for spec in (manifest.outputs or {}).values():
         if isinstance(spec, dict) and spec.get("type") == "artifact_directory":
             subdirs.append(Path(str(spec.get("path") or "output")).name)
     if not subdirs:
-        subdirs = ["output"]
+        workspace = manifest.config.get("workspace") or {}
+        subdirs = [Path(str(workspace.get("output_dir") or "output")).name]
     files: list[tuple[str, Path]] = []
     for subdir in subdirs:
         base = exec_dir / subdir

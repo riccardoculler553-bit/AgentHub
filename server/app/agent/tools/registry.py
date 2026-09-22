@@ -50,6 +50,7 @@ def build_default_registry(hub=None) -> ToolRegistry:
     from app.agent.tools.capability import register_capability_tools
     from app.agent.tools.command import register_command_tools
     from app.agent.tools.device import register_device_tools
+    from app.agent.tools.process import register_process_tools
     from app.agent.tools.task import register_task_tools
     from app.agent.tools.workflow import register_workflow_tools
 
@@ -60,4 +61,5 @@ def build_default_registry(hub=None) -> ToolRegistry:
     register_workflow_tools(registry, hub)
     register_capability_tools(registry, hub)
     register_artifact_tools(registry, hub)
+    register_process_tools(registry, hub)
     return registry

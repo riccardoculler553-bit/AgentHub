@@ -206,9 +206,13 @@ class TaskDispatcher:
             return False
 
         try:
-            device_id = CapabilityResolver(db, self.device_link.hub).resolve_worker(
-                task.capability_name, version.version, task.target_device_id
+            from app.execution.history import ExecutionHistory
+
+            input_mb = ExecutionHistory(db).input_size_mb(task)
+            path = CapabilityResolver(db, self.device_link.hub).resolve_execution_path(
+                version, task.capability_name, task.target_device_id, input_mb=input_mb
             )
+            device_id = path.device_id
         except CapabilityNoWorker:
             # Transient: stay dispatchable, monitor sweeps retry. pending_since
             # is NOT reset here (V1.6 0.9): the PENDING wait is bounded by the
@@ -320,6 +324,15 @@ class TaskDispatcher:
                 "message_id": envelope.id, "connections": sent,
                 "capability": task.capability_name, "capability_version": version.version,
                 "package_id": package_id, "package_checksum": checksum,
+                # V1.7 §42: the selection is explainable, not a black box.
+                "execution_path": {
+                    "device_id": device_id,
+                    "estimated_completion_sec": round(path.estimated_completion_sec, 1),
+                    "predicted_runtime_sec": round(path.predicted_runtime_sec, 1),
+                    "confidence": round(path.confidence, 2),
+                    "explain": path.explain(),
+                    "reasons": path.reasons,
+                },
             },
         )
         db.commit()

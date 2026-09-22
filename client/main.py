@@ -58,6 +58,7 @@ from worker.capability.manager import CapabilityManager
 from worker.capability.puller import PackagePuller
 from worker.capability.uploader import ArtifactUploader
 from worker.manager import TaskManager
+from worker.process import ProcessSupervisor
 from worker.registry import reportable_capabilities
 
 
@@ -85,9 +86,19 @@ class DeviceClient:
                 server_url, lambda: self.identity.token if self.identity else ""
             ),
         )
+        # V1.7 §13: persistent-process supervisor - shares the Lazy Pull
+        # pipeline; statuses go out as process.status envelopes.
+        self.process_supervisor = ProcessSupervisor(
+            self.capability_manager, self._send_process_status
+        )
         self._capabilities = reportable_capabilities()
         self._caps_reported = False
         self._stop = asyncio.Event()
+
+    async def _send_process_status(self, payload: dict) -> None:
+        """Supervisor -> server status report (data plane: WS control, §14)."""
+        if self.ws_client is not None:
+            await self.ws_client.send(protocol.build_envelope("process.status", payload["data"]))
 
     def register(self, code: str | None = None) -> DeviceIdentity:
         if not code:
@@ -131,16 +142,49 @@ class DeviceClient:
             if installed:
                 packages = ", ".join(f"{c['name']}@{c['version']}" for c in installed)
                 print(f"[worker] capability packages reported: {packages}")
+            # V1.7 §22: environment snapshot (machine/runtime/automation/worker)
+            # on every connect - the server diffs fingerprints for drift.
+            try:
+                from worker.environment import collect
+
+                await self.ws_client.send(
+                    protocol.build_envelope("worker.environment", {"environment": collect()})
+                )
+            except Exception:
+                print("[worker] environment report failed")
         elif msg_type == "task.dispatch":
             await self.task_manager.on_dispatch(envelope)
         elif msg_type == "task.cancel":
             await self.task_manager.on_cancel(envelope.get("data", {}))
         elif msg_type == "capability.execute":
             await self.task_manager.on_capability_execute(envelope)
+        elif msg_type in ("process.start", "process.stop", "process.restart"):
+            # V1.7 §12: persistent-process control plane
+            await self._handle_process_message(msg_type, envelope)
         elif msg_type == "error":
             print(f"[ws] server error envelope: {json.dumps(envelope.get('data', {}), ensure_ascii=False)}")
         else:
             print(f"[ws] {msg_type}: {envelope.get('data')}")
+
+    async def _handle_process_message(self, msg_type: str, envelope: dict) -> None:
+        data = envelope.get("data", {})
+        process_id = str(data.get("process_id", ""))
+        try:
+            if msg_type == "process.start":
+                brief = await self.process_supervisor.start(data)
+            elif msg_type == "process.stop":
+                brief = await self.process_supervisor.stop(process_id)
+            else:
+                brief = await self.process_supervisor.restart(process_id)
+            print(f"[process] {msg_type} -> {brief.get('status')} ({process_id})")
+        except Exception as exc:  # noqa: BLE001 - report the failure, keep the loop alive
+            print(f"[process] {msg_type} failed: {exc}")
+            await self._send_process_status({
+                "data": {"process_id": process_id, "status": "FAILED", "error": str(exc)[:500]}
+            })
+        finally:
+            ack = protocol.build_envelope("message_ack", {"success": True}, msg_id=envelope.get("id"))
+            await self.ws_client.send(ack)
 
     async def run(self) -> None:
         self.identity = self.identities.load()

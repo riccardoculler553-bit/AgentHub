@@ -118,3 +118,71 @@ class CapabilityResolver:
         #    Staying unresolved keeps the task PENDING (bounded wait) so an
         #    operator can install/point the capability instead.
         raise CapabilityNoWorker(capability_name, version or "(current)")
+
+    def resolve_execution_path(self, version_row, capability_name: str, explicit_worker_id: str | None = None, input_mb: float = 0.0):
+        """V1.7 §30-§43: deterministic execution path selection.
+
+        Hard filters first (online, fresh ad / explicit intent, §31), then a
+        per-candidate ETA from real history blended with the capability
+        baseline, transfer cost and current worker state. min(ETA) wins,
+        device_id breaks ties (§40). Returns an ExecutionPath with reasons.
+        """
+        from app.db.models import utcnow
+        from app.execution.history import ExecutionHistory
+        from app.execution.predictor import predict_eta
+
+        online = set(self._online_worker_ids())
+        if explicit_worker_id:
+            if explicit_worker_id not in online:
+                raise CapabilityNoWorker(capability_name, version_row.version)
+            candidates = [explicit_worker_id]
+        else:
+            candidates = [wid for wid in self._fresh_reporters(capability_name, version_row.version) if wid in online]
+        if not candidates:
+            raise CapabilityNoWorker(capability_name, version_row.version)
+
+        stats_by_device = ExecutionHistory(self.db).device_stats(
+            capability_name, version_row.version
+        )
+        baseline = ((version_row.config or {}).get("resources") or {}).get("estimated_duration_sec")
+        live_counts = self._live_counts(candidates)
+        remaining = self._remaining_timeout(candidates)
+
+        paths = []
+        for wid in candidates:
+            path = predict_eta(
+                wid,
+                stats_by_device.get(wid),
+                baseline,
+                input_mb,
+                live_counts.get(wid, 0),
+                remaining.get(wid),
+            )
+            path.reasons.append("execution-path-resolver")
+            if wid == explicit_worker_id:
+                path.reasons.append("explicit-device")
+            paths.append(path)
+        paths.sort(key=lambda p: (p.estimated_completion_sec, p.device_id))
+        return paths[0]
+
+    def _remaining_timeout(self, worker_ids: list[str]) -> dict[str, float | None]:
+        """Remaining timeout_at of each worker's live task (queue-wait input)."""
+        if not worker_ids:
+            return {}
+        now = utcnow()
+        rows = self.db.execute(
+            select(Task.target_device_id, Task.timeout_at)
+            .where(
+                Task.target_device_id.in_(worker_ids),
+                Task.status.in_(LIVE_TASK_STATES),
+                Task.timeout_at.isnot(None),
+            )
+        ).all()
+        result: dict[str, float | None] = {}
+        for device_id, timeout_at in rows:
+            current = result.get(device_id)
+            if timeout_at is None:
+                continue
+            secs = max(0.0, (timeout_at - now).total_seconds())
+            result[device_id] = secs if current is None else min(current, secs)
+        return result

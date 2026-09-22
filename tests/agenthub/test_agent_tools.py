@@ -120,6 +120,11 @@ def test_default_registry_has_standard_tools(registry):
         "run_capability": ("ACTION", settings.agent_confirm_actions),
         # V1.5 artifact tool (结果落盘)
         "save_artifact": ("WRITE", False),
+        # V1.7 persistent-process tools (§52)
+        "start_process": ("ACTION", True),
+        "stop_process": ("WRITE", False),
+        "restart_process": ("WRITE", False),
+        "get_worker_processes": ("READ", False),
     }
     assert {t.name for t in registry.all()} == set(expected)
     for name, (risk, confirm) in expected.items():

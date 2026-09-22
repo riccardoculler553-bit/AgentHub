@@ -38,6 +38,13 @@ class MessageType(StrEnum):
     CAPABILITY_PROGRESS = "capability.progress"  # device -> server
     CAPABILITY_RESULT = "capability.result"      # device -> server (terminal)
     WORKER_CAPABILITIES = "worker.capabilities"  # device -> server (installed packages)
+    # --- AgentHub V1.7 Worker Platformization ---
+    WORKER_ENVIRONMENT = "worker.environment"    # device -> server (env snapshot §22)
+    PROCESS_START = "process.start"              # server -> device (§12)
+    PROCESS_STOP = "process.stop"                # server -> device
+    PROCESS_RESTART = "process.restart"          # server -> device
+    PROCESS_STATUS = "process.status"            # device -> server (instance status)
+    PROCESS_LOG = "process.log"                  # device -> server (log tail, on demand)
 
 
 class ProtocolError(ValueError):

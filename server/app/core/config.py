@@ -128,6 +128,10 @@ class Settings:
         # trusted for worker selection (the worker re-reports on every
         # connect, so healthy ads are refreshed far more often).
         self.worker_ad_ttl = int(os.getenv("WORKER_AD_TTL", "86400"))
+        # V1.7 Execution Path Resolver (§40-§41): startup warm-up and the
+        # conservative fleet-wide transfer rate used by the ETA estimate.
+        self.execution_startup_sec = int(os.getenv("EXECUTION_STARTUP_SEC", "30"))
+        self.execution_transfer_mbps = float(os.getenv("EXECUTION_TRANSFER_MBPS", "25"))
 
 
 settings = Settings()

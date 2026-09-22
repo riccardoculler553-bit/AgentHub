@@ -33,6 +33,7 @@ class FakeWorker:
         max_dispatches: int = 8,
         capability_artifact: bytes | None = None,
         installed_capabilities: list[dict] | None = None,
+        environment: dict | None = None,
     ) -> None:
         self.client = client
         self.token = token
@@ -43,6 +44,8 @@ class FakeWorker:
         # V1.4 §17: installed automation capability packages to report via
         # worker.capabilities, e.g. [{"name": "a.b.c", "version": "1.0.0"}]
         self.installed_capabilities = installed_capabilities
+        # V1.7 §22: environment snapshot to report via worker.environment
+        self.environment = environment
         self.received: list[dict] = []
         self.errors: list[Exception] = []
         self._session = None
@@ -104,6 +107,17 @@ class FakeWorker:
                         "version": 1,
                         "timestamp": 1,
                         "data": {"capabilities": list(self.installed_capabilities)},
+                    }
+                )
+                self.received.append(session.receive_json())  # message_ack
+            if self.environment is not None:
+                session.send_json(
+                    {
+                        "id": "env_1",
+                        "type": "worker.environment",
+                        "version": 1,
+                        "timestamp": 1,
+                        "data": {"environment": dict(self.environment)},
                     }
                 )
                 self.received.append(session.receive_json())  # message_ack
