@@ -25,7 +25,7 @@ from worker.ledger import ExecutionLedger
 from worker.manager import TaskManager
 
 from .test_worker_capability import build_package
-from ._worker import FakeWorker, register_device, wait_until
+from ._worker import FakeWorker, register_device, wait_for_worker_capabilities, wait_until
 
 CAP_NAME = "data.input.demo"
 CAP_VERSION = "1.0.0"
@@ -114,13 +114,21 @@ def _make_manager(tmp_path, downloader) -> tuple[TaskManager, FakeWS, FakeUpload
 
 
 class FakePullerShim:
+    """V1.6 P0 0.6 file contract: streams payload to a file, returns the path."""
+
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
         self.calls: list[tuple[str, str | None]] = []
 
-    async def download(self, package_id: str, checksum: str | None = None) -> bytes:
+    async def download(self, package_id: str, checksum: str | None = None, cancel=None):
+        from worker.capability.puller import packages_root
+
         self.calls.append((package_id, checksum))
-        return self.payload
+        root = packages_root()
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{package_id}.zip"
+        path.write_bytes(self.payload)
+        return path
 
 
 def _execute_envelope(input_artifacts: list[dict], checksums: dict | None = None) -> dict:
@@ -331,15 +339,42 @@ def _publish_capability(client, name: str = CAP_NAME, version: str = CAP_VERSION
     assert res.status_code == 200, res.text
 
 
-def _upload_input_artifact(client, token: str, name: str, content: bytes) -> dict:
+def _upload_input_artifact(client, token: str, name: str, content: bytes, task_id: str = "") -> dict:
     res = client.post(
         "/api/artifacts",
         files={"file": (name, content, "application/octet-stream")},
-        data={"name": name, "type": "file"},
+        data={"name": name, "type": "file", "task_id": task_id},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert res.status_code == 201, res.text
     return res.json()
+
+
+def test_download_acl_binds_task_artifacts_to_target_worker(client):
+    """V1.6 P0 0.15 (audit M1): task-bound artifacts are only readable by the
+    task's target worker (or admin); unbound artifacts stay shared datasets."""
+    device_a = register_device(client, "ACL目标机")
+    device_b = register_device(client, "ACL旁观机")
+    token_a, token_b = device_a["device_token"], device_b["device_token"]
+
+    # task-bound upload: task_abc does not exist as a row -> task lookup fails
+    # too, so ANY device other than the uploader is rejected (defensive).
+    bound = _upload_input_artifact(client, token_a, "bound.xlsx", b"BOUND", task_id="task_acl_case")
+    unbound = _upload_input_artifact(client, token_a, "shared.xlsx", b"SHARED")
+
+    uploader_headers = {"Authorization": f"Bearer {token_a}"}
+    other_headers = {"Authorization": f"Bearer {token_b}"}
+
+    # unbound artifact: every valid device token may read it
+    res = client.get(f"/api/artifacts/{unbound['artifact_id']}/download", headers=other_headers)
+    assert res.status_code == 200
+    # uploader may always re-read its own upload
+    res = client.get(f"/api/artifacts/{bound['artifact_id']}/download", headers=uploader_headers)
+    assert res.status_code == 200
+    # another device may NOT read a task-bound artifact of a foreign task
+    res = client.get(f"/api/artifacts/{bound['artifact_id']}/download", headers=other_headers)
+    assert res.status_code == 403
+    assert res.json()["detail"]["code"] == "artifact_forbidden"
 
 
 def test_dispatch_carries_input_artifacts(client):
@@ -348,8 +383,16 @@ def test_dispatch_carries_input_artifacts(client):
     device = register_device(client, "输入链路测试机")
     token = device["device_token"]
 
-    worker = FakeWorker(client, token, behaviour="success")
+    worker = FakeWorker(
+        client,
+        token,
+        behaviour="success",
+        # V1.6 P0 0.10: the resolver only selects workers advertising the
+        # capability - the fallback for silent workers is gone.
+        installed_capabilities=[{"name": CAP_NAME, "version": CAP_VERSION}],
+    )
     worker.start()
+    assert wait_for_worker_capabilities(client, device["device_id"], (CAP_NAME,))
     try:
         uploaded = _upload_input_artifact(client, token, "data.xlsx", b"DATA")
         mapping = _upload_input_artifact(client, token, "mapping.xlsx", b"MAP")

@@ -47,6 +47,27 @@ def test_fail_running_parks_orphans_at_startup(ledger):
     assert len(ledger.unreported_results()) == 1
 
 
+def test_restart_drops_never_executed_claims(ledger):
+    """V1.6 P0 0.3: an ACCEPTED (queued, never executed) attempt must not be
+    reported FAILED at process restart - a write operation never ran, so the
+    claim is dropped and the server's liveness scan converges the task."""
+    ledger.claim("t1", "s1", "a1", "echo")  # ACCEPTED, never ran
+    ledger.claim("t2", "s2", "a2", "echo")
+    ledger.mark_running("a2")  # RUNNING: executor was live
+    assert ledger.drop_unexecuted() == 1
+    assert ledger.get("a1") is None  # dropped: no false FAILED report
+    assert ledger.unreported_results() == []
+    # the RUNNING row still parks FAILED via fail_running
+    assert ledger.fail_running() == 1
+    assert ledger.get("a2")["status"] == "FAILED"
+
+
+def test_fail_running_leaves_accepted_rows_alone(ledger):
+    ledger.claim("t1", "s1", "a1", "echo")
+    assert ledger.fail_running() == 0  # only RUNNING rows park FAILED
+    assert ledger.get("a1")["status"] == "ACCEPTED"
+
+
 class RecordingClient:
     def __init__(self) -> None:
         self.sent: list[dict] = []

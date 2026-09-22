@@ -130,6 +130,17 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
     app.state.hub = ConnectionHub()
 
+    # V1.6 P0 0.7/0.18 (audit H1): warn loudly when the management plane would
+    # be open without any role token; require_role() fails closed on
+    # non-loopback binds.
+    if not any(getattr(settings, t, "") for t in ("admin_token", "operator_token", "viewer_token")):
+        from app.auth.admin import admin_fail_open_allowed
+
+        if admin_fail_open_allowed():
+            logger.warning("no RBAC tokens configured: management APIs are open on loopback bind only")
+        else:
+            logger.warning("no RBAC tokens configured: management APIs FAIL CLOSED (non-loopback bind)")
+
     app.include_router(registration.router)
     app.include_router(devices.router)
     app.include_router(ws_api.router)

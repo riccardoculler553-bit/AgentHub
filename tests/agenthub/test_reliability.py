@@ -303,6 +303,49 @@ def test_device_api_requires_admin(client, monkeypatch):
     )
 
 
+def test_admin_fail_closed_without_token_on_public_bind(client, monkeypatch):
+    """V1.6 P0 0.7 (audit H1): empty AGENTHUB_ADMIN_TOKEN must NOT open the
+    management plane when the server binds a non-loopback address."""
+    monkeypatch.setattr(settings, "admin_token", "")
+    monkeypatch.setattr(settings, "host", "0.0.0.0")
+    assert client.get("/api/devices").status_code == 401
+    assert client.get("/api/artifacts").status_code == 401
+    # loopback bind keeps the local-dev open mode
+    monkeypatch.setattr(settings, "host", "127.0.0.1")
+    assert client.get("/api/devices").status_code == 200
+
+
+def test_rbac_role_tokens_are_hierarchical(client, monkeypatch):
+    """V1.6 P0 0.18: admin > operator > viewer. Viewer reads, operator
+    dispatches, admin revokes; lower roles cannot reach higher endpoints."""
+    monkeypatch.setattr(settings, "admin_token", "adm-tok")
+    monkeypatch.setattr(settings, "operator_token", "op-tok")
+    monkeypatch.setattr(settings, "viewer_token", "view-tok")
+    device = register_device(client, "RBAC机")
+
+    # no token -> 401 (fail-closed with roles configured)
+    assert client.get("/api/tasks").status_code == 401
+    # viewer: reads pass...
+    assert client.get("/api/tasks", headers={"X-Admin-Token": "view-tok"}).status_code == 200
+    assert client.get("/api/devices", headers={"X-Admin-Token": "view-tok"}).status_code == 200
+    # ...but mutations are forbidden (403, not 401: authenticated, unauthorized)
+    res = client.post("/api/tasks", json={}, headers={"X-Admin-Token": "view-tok"})
+    assert res.status_code == 403, res.text
+    # operator: task mutation passes auth (payload may still be invalid -> 422)
+    res = client.post("/api/tasks", json={}, headers={"X-Admin-Token": "op-tok"})
+    assert res.status_code == 422
+    # operator cannot revoke (admin-only)
+    res = client.post(
+        f"/api/devices/{device['device_id']}/revoke", headers={"X-Admin-Token": "op-tok"}
+    )
+    assert res.status_code == 403
+    # admin passes everywhere
+    res = client.post(
+        f"/api/devices/{device['device_id']}/revoke", headers={"X-Admin-Token": "adm-tok"}
+    )
+    assert res.status_code == 200
+
+
 # ---------------------------------------------------- §38 多连接聚合在线
 
 

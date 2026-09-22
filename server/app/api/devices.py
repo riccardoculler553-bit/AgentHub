@@ -4,9 +4,10 @@ import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.auth.admin import require_admin
+from app.auth.admin import require_admin, require_operator, require_viewer
 from app.core.background import spawn
 from app.core.exceptions import DeviceLinkError
 from app.db.database import get_db
@@ -19,9 +20,23 @@ from app.device.models import (
 )
 from app.device.service import DeviceService
 from app.registration.service import RegistrationService
+from app.task.db_models import Task
+from app.task.service import LIVE_TASK_STATES
 from app.websocket.protocol import Envelope, MessageType, new_message_id
 
 router = APIRouter(prefix="/api", tags=["devices"])
+
+
+def _live_task_counts(db: Session, device_ids: list[str]) -> dict[str, int]:
+    """V1.6 P0 0.8: live-task count per device feeds the scheduling axis."""
+    if not device_ids:
+        return {}
+    rows = db.execute(
+        select(Task.target_device_id, func.count(Task.task_id))
+        .where(Task.target_device_id.in_(device_ids), Task.status.in_(LIVE_TASK_STATES))
+        .group_by(Task.target_device_id)
+    ).all()
+    return {device_id: count for device_id, count in rows}
 
 
 def _to_http_error(exc: DeviceLinkError) -> HTTPException:
@@ -55,24 +70,35 @@ def device_uuid_suffix() -> str:
     return uuid.uuid4().hex[:6]
 
 
-@router.get("/devices", response_model=list[DeviceOut], dependencies=[Depends(require_admin)])
+@router.get("/devices", response_model=list[DeviceOut], dependencies=[Depends(require_viewer)])
 def list_devices(request: Request, db: Session = Depends(get_db)):
     hub = request.app.state.hub
     service = DeviceService(db)
+    devices = service.list_devices()
+    counts = _live_task_counts(db, [d.device_id for d in devices])
     return [
-        service.to_out(device, connection_count=hub.connection_count(device.device_id))
-        for device in service.list_devices()
+        service.to_out(
+            device,
+            connection_count=hub.connection_count(device.device_id),
+            live_tasks=counts.get(device.device_id, 0),
+        )
+        for device in devices
     ]
 
 
-@router.get("/devices/{device_id}", response_model=DeviceOut, dependencies=[Depends(require_admin)])
+@router.get("/devices/{device_id}", response_model=DeviceOut, dependencies=[Depends(require_viewer)])
 def get_device(device_id: str, request: Request, db: Session = Depends(get_db)):
     hub = request.app.state.hub
     try:
         device = DeviceService(db).get_device(device_id)
     except DeviceLinkError as exc:
         raise _to_http_error(exc) from exc
-    return DeviceService(db).to_out(device, connection_count=hub.connection_count(device.device_id))
+    counts = _live_task_counts(db, [device.device_id])
+    return DeviceService(db).to_out(
+        device,
+        connection_count=hub.connection_count(device.device_id),
+        live_tasks=counts.get(device.device_id, 0),
+    )
 
 
 @router.post("/devices/{device_id}/revoke", response_model=DeviceOut, dependencies=[Depends(require_admin)])
@@ -91,7 +117,7 @@ async def revoke_device(device_id: str, request: Request, db: Session = Depends(
     return service.to_out(device, connection_count=0)
 
 
-@router.post("/devices/{device_id}/messages", response_model=DeviceMessageOut, dependencies=[Depends(require_admin)])
+@router.post("/devices/{device_id}/messages", response_model=DeviceMessageOut, dependencies=[Depends(require_operator)])
 async def send_message(device_id: str, payload: DeviceMessageIn, request: Request, db: Session = Depends(get_db)):
     hub = request.app.state.hub
     try:

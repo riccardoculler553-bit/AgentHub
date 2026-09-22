@@ -8,7 +8,7 @@ import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.auth.admin import require_admin
+from app.auth.admin import require_admin, require_operator, require_viewer
 from app.capability.service import CapabilityService
 from app.command.service import CommandError, CommandService
 from app.core.background import spawn
@@ -20,7 +20,9 @@ from app.task.errors import TaskError
 from app.task.monitor import TaskMonitor
 from app.task.service import TaskService
 
-router = APIRouter(prefix="/api", tags=["agenthub"], dependencies=[Depends(require_admin)])
+# V1.6 P0 0.18: reads require viewer, mutations require operator, admin
+# passes everywhere (hierarchical require_role).
+router = APIRouter(prefix="/api", tags=["agenthub"], dependencies=[Depends(require_viewer)])
 
 
 def _task_error(exc: TaskError) -> HTTPException:
@@ -42,6 +44,11 @@ def _task_detail(db: Session, task_id: str) -> schemas.TaskDetailOut:
         priority=task.priority,
         max_attempts=task.max_attempts,
         timeout_seconds=task.timeout_seconds,
+        source_type=task.source_type,
+        capability_name=task.capability_name,
+        capability_version=task.capability_version,
+        package_id=task.package_id,
+        package_checksum=task.package_checksum,
         created_at=task.created_at,
         started_at=task.started_at,
         finished_at=task.finished_at,
@@ -75,7 +82,8 @@ def _task_detail(db: Session, task_id: str) -> schemas.TaskDetailOut:
 # ---------------------------------------------------------------------- tasks
 
 
-@router.post("/tasks", response_model=schemas.TaskDetailOut, status_code=status.HTTP_201_CREATED)
+@router.post("/tasks", response_model=schemas.TaskDetailOut, status_code=status.HTTP_201_CREATED,
+             dependencies=[Depends(require_operator)])
 async def create_task(payload: schemas.TaskCreateIn, request: Request, db: Session = Depends(get_db)):
     """Validate the ExecutionPlan -> create Task(PENDING) -> dispatch if online."""
     try:
@@ -100,6 +108,9 @@ def list_tasks(
         schemas.TaskOut(
             task_id=t.task_id, name=t.name, target_device_id=t.target_device_id, status=t.status,
             priority=t.priority, max_attempts=t.max_attempts, timeout_seconds=t.timeout_seconds,
+            source_type=t.source_type, capability_name=t.capability_name,
+            capability_version=t.capability_version, package_id=t.package_id,
+            package_checksum=t.package_checksum,
             created_at=t.created_at,
             started_at=t.started_at, finished_at=t.finished_at, timeout_at=t.timeout_at,
         )
@@ -129,7 +140,8 @@ def get_task_events(task_id: str, db: Session = Depends(get_db)):
         raise _task_error(exc) from exc
 
 
-@router.post("/tasks/{task_id}/cancel", response_model=schemas.TaskDetailOut)
+@router.post("/tasks/{task_id}/cancel", response_model=schemas.TaskDetailOut,
+             dependencies=[Depends(require_operator)])
 async def cancel_task(task_id: str, request: Request, db: Session = Depends(get_db)):
     try:
         result = TaskService(db).request_cancel(task_id)
@@ -141,7 +153,8 @@ async def cancel_task(task_id: str, request: Request, db: Session = Depends(get_
     return _task_detail(db, task_id)
 
 
-@router.post("/tasks/{task_id}/retry", response_model=schemas.TaskDetailOut)
+@router.post("/tasks/{task_id}/retry", response_model=schemas.TaskDetailOut,
+             dependencies=[Depends(require_operator)])
 async def retry_task(task_id: str, request: Request, db: Session = Depends(get_db)):
     try:
         TaskService(db).request_retry(task_id)

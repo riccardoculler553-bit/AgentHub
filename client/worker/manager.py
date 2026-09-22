@@ -42,6 +42,8 @@ from worker.capability.downloader import (
     ArtifactChecksumMismatch,
     ArtifactDownloadCancelled,
     ArtifactDownloadFailed,
+    ArtifactDownloadStalled,
+    ArtifactDownloadTimeout,
 )
 from worker.executor import ExecutionError
 from worker.ledger import ExecutionLedger
@@ -90,12 +92,17 @@ class TaskManager:
         self._consumer: asyncio.Task | None = None
         self._flush_task: asyncio.Task | None = None
         self._ws_client = None
-        # Startup recovery: RUNNING attempts from a previous process cannot be
-        # tracked anymore - park them FAILED so reconnect reports the truth
-        # instead of blocking the ledger forever.
+        # Startup recovery (V1.6 P0 0.3): RUNNING attempts from a previous
+        # process cannot be tracked anymore - park them FAILED so reconnect
+        # reports the truth instead of blocking the ledger forever. ACCEPTED
+        # attempts never executed: their claims are dropped so the server's
+        # liveness scan converges them (retryable), never a false FAILED.
         parked = self.ledger.fail_running()
         if parked:
             logger.warning("parked %s orphaned attempt(s) from a previous run", parked)
+        dropped = self.ledger.drop_unexecuted()
+        if dropped:
+            logger.info("dropped %s never-executed claim(s) from a previous run", dropped)
 
     # ------------------------------------------------------------------ wiring
 
@@ -485,6 +492,9 @@ class TaskManager:
             # V1.5: keep the TAIL (traceback / business ERROR lines) — a head
             # truncation here used to cut the traceback off the report.
             "message": str(payload.get("message", ""))[-1000:],
+            # V1.6 P0 0.14: worker hint for the server's risk-aware retry
+            # policy - it may only assist READ tasks, never override WRITE/ACTION.
+            "retryable": bool(payload.get("retryable")),
         })
 
     async def _prepare_inputs(self, state: dict, context: ExecutionContext, manifest, progress) -> None:
@@ -529,6 +539,12 @@ class TaskManager:
                 raise _CapabilityInputError("CAPABILITY_CANCELLED", str(exc)) from exc
             except ArtifactChecksumMismatch as exc:
                 raise _CapabilityInputError("ARTIFACT_CHECKSUM_MISMATCH", str(exc)) from exc
+            except ArtifactDownloadStalled as exc:
+                # V1.6 P0 0.15: connect / stall / total are distinct facts -
+                # never collapse them into one TIMEOUT (readability §3.4).
+                raise _CapabilityInputError("ARTIFACT_DOWNLOAD_STALLED", str(exc)) from exc
+            except ArtifactDownloadTimeout as exc:
+                raise _CapabilityInputError("ARTIFACT_DOWNLOAD_TIMEOUT", str(exc)) from exc
             except ArtifactDownloadFailed as exc:
                 raise _CapabilityInputError("ARTIFACT_DOWNLOAD_FAILED", str(exc)) from exc
             filename = Path(str(entry.get("name") or "").strip() or f"{artifact_id}.bin").name

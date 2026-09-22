@@ -138,13 +138,25 @@ class ExecutionLedger:
     def fail_running(self, reason: str = "worker_restarted") -> int:
         """Process startup: attempts left RUNNING by a previous process are
         dead (their executors are gone); park them as FAILED so they are
-        reported instead of blocking future claims."""
+        reported instead of blocking future claims (V1.6 0.3: report the
+        truth, never silently re-run)."""
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE executions SET status = 'FAILED', error_code = 'WORKER_RESTARTED',"
-                " error_message = ?, finished_at = ? WHERE status IN ('ACCEPTED','RUNNING')",
+                " error_message = ?, finished_at = ? WHERE status = 'RUNNING'",
                 (reason, _now()),
             )
+            self._conn.commit()
+            return cur.rowcount
+
+    def drop_unexecuted(self) -> int:
+        """V1.6 P0 0.3: attempts still ACCEPTED at process restart were queued
+        but NEVER executed - reporting them FAILED would lie about a write
+        operation. Drop the local claim instead: the server's ACCEPTED-
+        liveness scan converges the task to a retryable TIMEOUT and a new
+        attempt may be dispatched freely."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM executions WHERE status = 'ACCEPTED'")
             self._conn.commit()
             return cur.rowcount
 

@@ -14,7 +14,7 @@ from app.core.config import settings
 from app.db.database import SessionLocal
 from app.artifact.db_models import Artifact
 
-from ._worker import FakeWorker, register_device, wait_for_capabilities
+from ._worker import FakeWorker, register_device, wait_for_capabilities, wait_for_worker_capabilities
 from .test_workflow_capability import _publish_capability
 
 
@@ -86,8 +86,12 @@ async def test_run_capability_end_to_end(client, registry, device):
     _publish_capability(client)
     worker = FakeWorker(
         client, device["device_token"], behaviour="success", capability_artifact=b"tool artifact",
+        # V1.6 P0 0.10: the resolver only selects workers advertising the
+        # capability - the arbitrary-online fallback is gone.
+        installed_capabilities=[{"name": "erp.order.export", "version": "1.0.0"}],
     )
     worker.start()
+    assert wait_for_worker_capabilities(client, device["device_id"], ("erp.order.export",))
     try:
         r = await _call(
             registry, "run_capability",
@@ -123,8 +127,12 @@ async def test_run_capability_unknown_fails_validation(registry):
 async def test_run_capability_unpinned_version_resolves_current(client, registry, device):
     """version=None -> TaskService pins the capability's current PUBLISHED one."""
     _publish_capability(client)
-    worker = FakeWorker(client, device["device_token"], behaviour="success")
+    worker = FakeWorker(
+        client, device["device_token"], behaviour="success",
+        installed_capabilities=[{"name": "erp.order.export", "version": "1.0.0"}],
+    )
     worker.start()
+    assert wait_for_worker_capabilities(client, device["device_id"], ("erp.order.export",))
     try:
         r = await _call(registry, "run_capability", {"capability": "erp.order.export", "wait": True})
         assert r.success, r

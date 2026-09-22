@@ -11,11 +11,11 @@ from app.agent.mvp.schemas import (
 from app.agent.mvp.service import MvpAgentService
 from app.agent.runs import STATUS_WAITING_USER, AgentRunService
 from app.agent.legacy.service import AgentService as LegacyAgentService
-from app.auth.admin import require_admin
+from app.auth.admin import require_operator
 from app.db.database import SessionLocal
 from app.task import models as schemas
 
-router = APIRouter(prefix="/api/agent", tags=["agent"], dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/api/agent", tags=["agent"], dependencies=[Depends(require_operator)])
 
 
 @router.post("/run", response_model=schemas.AgentRunOut)

@@ -13,11 +13,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.agent.tools.base import AgentTool, RiskLevel, ToolErrorCodes, ToolResult
-from app.agent.tools.device import _live_busy_device_ids, _resolve_device
+from app.agent.tools.context import current_run_id
+from app.agent.tools.device import _resolve_device
 from app.agent.tools.registry import ToolRegistry
-from app.agent.tools.task import _wait_terminal
 from app.command.service import CommandDisabled, CommandError, CommandNotFound, CommandService
 from app.core.config import settings
+from app.db.database import SessionLocal
 from app.task import models as schemas
 from app.task.dispatcher import TaskDispatcher
 from app.task.errors import TaskError
@@ -37,13 +38,6 @@ def register_command_tools(registry: ToolRegistry, hub: Any = None) -> None:
         device, err = _resolve_device(db, args["device_name"])
         if err:
             return err
-        # busy pre-check gives the LLM a clean DEVICE_BUSY instead of a
-        # doomed task (doc §86: observe -> replan, never a dead loop)
-        if device.device_id in _live_busy_device_ids(db):
-            return ToolResult.fail(
-                ToolErrorCodes.DEVICE_BUSY,
-                f"device '{device.name}' is running another task",
-            )
         # pre-validate against the command registry so the LLM sees the
         # canonical codes (COMMAND_NOT_FOUND / INVALID_ARGS), not a wrapped
         # task validation error (PDF §119: no script paths, ever)
@@ -69,20 +63,41 @@ def register_command_tools(registry: ToolRegistry, hub: Any = None) -> None:
         # dispatch immediately; offline -> PENDING -> TaskMonitor re-dispatches
         if hub is not None:
             await TaskDispatcher(hub).dispatch_task(task.task_id)
-        status, result = await _wait_terminal(task.task_id, settings.agent_tool_wait_max)
+        # V1.6 P0 0.16: link Task -> AgentRun so the terminal notification can
+        # find the conversation (same contract as run_capability), and STOP
+        # holding the tool-loop as a ~1900s waiter: the tool returns right
+        # after dispatch; the terminal fact reaches the user via the proactive
+        # notification sink (agent/notify.py) or get_task_detail polling.
+        run_id = current_run_id.get()
+        if run_id:
+            try:
+                from app.agent.runs import AgentRunService
+
+                AgentRunService(SessionLocal()).set_task(
+                    run_id, task.task_id, ack_reply=f"已创建任务 {task.task_id}"
+                )
+            except Exception:  # noqa: BLE001 - notification link is best-effort
+                pass
+        with SessionLocal() as fresh_db:
+            status = TaskService(fresh_db).get(task.task_id).status
         return ToolResult.ok(
-            {"task_id": task.task_id, "status": status, "device_name": device.name, "result": result}
+            {
+                "task_id": task.task_id,
+                "command": args["command"],
+                "device_name": device.name,
+                "status": status,
+                "note": "命令已下发；执行完成后会主动通知结果，期间可用 get_task_detail 查询进度。",
+            }
         )
 
     registry.register(
         AgentTool(
             name="execute_command",
-            description="在指定设备上执行一条已注册的业务命令（如 yingdao.audit）。命令必须存在于系统注册表，不接受任何脚本路径。",
+            description="在指定设备上执行一条已注册的业务命令（如 yingdao.audit）。命令必须存在于系统注册表，不接受任何脚本路径。立即返回 task_id，完成后主动推送结果。",
             handler=execute_command,
             args_schema=ExecuteCommandArgs,
             risk_level=RiskLevel.ACTION,
             requires_confirmation=settings.agent_confirm_actions,
             max_calls=2,
-            waits_task=True,
         )
     )

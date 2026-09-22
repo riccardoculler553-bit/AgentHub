@@ -5,17 +5,19 @@ publish, worker capability views.
 Worker endpoint (device Bearer token OR admin): package download for Lazy Pull.
 """
 
+import hashlib
 import hmac
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.artifact.service import safe_artifact_name
-from app.auth.admin import require_admin
+from app.auth.admin import require_admin, require_viewer
 from app.capability_runtime import models as schemas
 from app.capability_runtime.errors import CapabilityError, CapabilityVersionNotFound
-from app.capability_runtime.package_service import PackageService, peek_manifest
+from app.capability_runtime.package_service import PackageService, peek_manifest_path
 from app.capability_runtime.service import CapabilityService
 from app.capability_runtime.worker_registry import WorkerCapabilityService
 from app.auth.token import TokenService
@@ -26,7 +28,9 @@ from sqlalchemy import select
 
 from app.db.models import Device
 
-router = APIRouter(prefix="/api", tags=["capability"], dependencies=[Depends(require_admin)])
+# V1.6 P0 0.18: reads require viewer; capability publishing/mutation is
+# admin-only (operator may dispatch, not change the registry).
+router = APIRouter(prefix="/api", tags=["capability"])
 worker_router = APIRouter(prefix="/api", tags=["capability"])
 
 
@@ -99,14 +103,14 @@ def _require_device_or_admin(
 # ---------------------------------------------------------------- definitions
 
 
-@router.get("/capabilities", response_model=list[schemas.CapabilityOut])
+@router.get("/capabilities", response_model=list[schemas.CapabilityOut], dependencies=[Depends(require_viewer)])
 def list_capabilities(enabled_only: bool = False, db: Session = Depends(get_db)):
     """Automation capabilities (V1.4 §61). Device command capabilities live
     under /api/device-capabilities."""
     return [_capability_out(c) for c in CapabilityService(db).list_capabilities(enabled_only)]
 
 
-@router.post("/capabilities", response_model=schemas.CapabilityOut, status_code=201)
+@router.post("/capabilities", response_model=schemas.CapabilityOut, status_code=201, dependencies=[Depends(require_admin)])
 def create_capability(payload: schemas.CapabilityCreateIn, db: Session = Depends(get_db)):
     try:
         row = CapabilityService(db).create_capability(
@@ -125,7 +129,7 @@ def create_capability(payload: schemas.CapabilityCreateIn, db: Session = Depends
     return _capability_out(row)
 
 
-@router.get("/capabilities/{name}", response_model=schemas.CapabilityOut)
+@router.get("/capabilities/{name}", response_model=schemas.CapabilityOut, dependencies=[Depends(require_viewer)])
 def get_capability(name: str, db: Session = Depends(get_db)):
     try:
         return _capability_out(CapabilityService(db).require_capability(name))
@@ -133,7 +137,7 @@ def get_capability(name: str, db: Session = Depends(get_db)):
         raise _capability_error(exc) from exc
 
 
-@router.patch("/capabilities/{name}", response_model=schemas.CapabilityOut)
+@router.patch("/capabilities/{name}", response_model=schemas.CapabilityOut, dependencies=[Depends(require_admin)])
 def update_capability(name: str, payload: schemas.CapabilityUpdateIn, db: Session = Depends(get_db)):
     try:
         row = CapabilityService(db).update_capability(
@@ -150,7 +154,7 @@ def update_capability(name: str, payload: schemas.CapabilityUpdateIn, db: Sessio
 # ------------------------------------------------------------------- versions
 
 
-@router.get("/capabilities/{name}/versions", response_model=list[schemas.CapabilityVersionOut])
+@router.get("/capabilities/{name}/versions", response_model=list[schemas.CapabilityVersionOut], dependencies=[Depends(require_viewer)])
 def list_versions(name: str, db: Session = Depends(get_db)):
     try:
         CapabilityService(db).require_capability(name)
@@ -159,18 +163,34 @@ def list_versions(name: str, db: Session = Depends(get_db)):
     return [_version_out(v) for v in CapabilityService(db).list_versions(name)]
 
 
-@router.post("/capabilities/{name}/versions", response_model=schemas.CapabilityVersionOut, status_code=201)
+@router.post("/capabilities/{name}/versions", response_model=schemas.CapabilityVersionOut, status_code=201, dependencies=[Depends(require_admin)])
 async def upload_version(name: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
     """Upload a capability package ZIP (§57: 开发 -> 上传 -> 创建版本). Version
     identity comes from the manifest inside the archive; record starts DRAFT."""
     try:
         service = CapabilityService(db)
         capability = service.require_capability(name)
-        zip_bytes = await file.read()
-        manifest = peek_manifest(zip_bytes)
-        package, manifest = PackageService(db).save_package(
-            name, manifest.version, capability.runtime_type, zip_bytes
-        )
+        # V1.6 P0 0.5 (audit H2): stream the ZIP to a temp file inside
+        # packages_root (same volume as the final store) instead of holding
+        # the whole archive in memory.
+        tmp_dir = PackageService.packages_root()
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp = tmp_dir / f".upl-{uuid4().hex}.zip"
+        digest = hashlib.sha256()
+        try:
+            with tmp.open("wb") as out:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    digest.update(chunk)
+            manifest = peek_manifest_path(tmp)
+            package, manifest = PackageService(db).save_package_from_path(
+                name, manifest.version, capability.runtime_type, tmp, checksum=digest.hexdigest()
+            )
+        finally:
+            tmp.unlink(missing_ok=True)
         version = service.create_version(
             name,
             manifest.version,
@@ -185,7 +205,7 @@ async def upload_version(name: str, file: UploadFile = File(...), db: Session = 
     return _version_out(version)
 
 
-@router.post("/capability-versions/{version_id}/publish", response_model=schemas.CapabilityVersionOut)
+@router.post("/capability-versions/{version_id}/publish", response_model=schemas.CapabilityVersionOut, dependencies=[Depends(require_admin)])
 def publish_version(version_id: int, db: Session = Depends(get_db)):
     try:
         service = CapabilityService(db)
@@ -201,7 +221,7 @@ def publish_version(version_id: int, db: Session = Depends(get_db)):
 # -------------------------------------------------------------------- workers
 
 
-@router.get("/worker-capabilities", response_model=list[schemas.WorkerCapabilityOut])
+@router.get("/worker-capabilities", response_model=list[schemas.WorkerCapabilityOut], dependencies=[Depends(require_viewer)])
 def list_worker_capabilities(db: Session = Depends(get_db)):
     return [
         schemas.WorkerCapabilityOut(worker_id=item["worker_id"], capabilities=item["capabilities"])

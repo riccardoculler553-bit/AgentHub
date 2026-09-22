@@ -6,6 +6,7 @@ returns the existing artifact instead of duplicating the blob.
 """
 
 import mimetypes
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -34,6 +35,21 @@ def sha256_bytes(data: bytes) -> str:
     import hashlib
 
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Incremental SHA-256 of a file (V1.6 P0 0.5: keeps large uploads out
+    of memory instead of read_bytes())."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def safe_artifact_name(name: str) -> str:
@@ -115,6 +131,73 @@ class ArtifactService:
         ).first()
         if row is None:
             raise ArtifactNotFound(artifact_id)
+        return row
+
+    def create_artifact_from_file(
+        self,
+        *,
+        name: str,
+        source: Path,
+        type: str = "file",
+        source_worker_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        step_run_id: str | None = None,
+        checksum: str | None = None,
+        mime_type: str | None = None,
+        move: bool = False,
+    ) -> Artifact:
+        """File-backed twin of create_artifact (V1.6 P0 0.5): bytes are never
+        fully in memory. move=True renames a prepared temp file into the store
+        (streamed upload path); move=False copies (server-local registration).
+
+        Dedupe caveat: with move=True a dedupe hit deletes the source temp
+        file (the caller's finally-block unlink is then a no-op)."""
+        size = source.stat().st_size
+        checksum = checksum or sha256_file(source)
+        if task_id and step_run_id:
+            existing = self.db.scalars(
+                select(Artifact).where(
+                    Artifact.task_id == task_id,
+                    Artifact.step_run_id == step_run_id,
+                    Artifact.checksum == checksum,
+                )
+            ).first()
+            if existing is not None:
+                if move:
+                    source.unlink(missing_ok=True)
+                return existing
+
+        artifact_id = f"art_{uuid4().hex[:16]}"
+        now = utcnow()
+        safe_name = safe_artifact_name(name)
+        relative_dir = Path(f"{now.year:04d}") / f"{now.month:02d}"
+        storage_name = f"{artifact_id}{Path(safe_name).suffix[:16]}"
+        relative_path = relative_dir / storage_name
+
+        target = self.artifacts_root() / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if move:
+            source.replace(target)
+        else:
+            shutil.copyfile(source, target)
+
+        row = Artifact(
+            artifact_id=artifact_id,
+            name=safe_name,
+            type=type,
+            mime_type=mime_type or mimetypes.guess_type(safe_name)[0],
+            size=size,
+            storage_path=str(relative_path).replace("\\", "/"),
+            checksum=checksum,
+            source_worker_id=source_worker_id,
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            step_run_id=step_run_id,
+            created_at=now,
+        )
+        self.db.add(row)
+        self.db.commit()
         return row
 
     def read_artifact_bytes(self, artifact_id: str) -> tuple[Artifact, bytes]:

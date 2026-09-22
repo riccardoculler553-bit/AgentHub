@@ -86,9 +86,11 @@ class TaskDispatcher:
                 db.commit()
                 return False
 
-            # Device lock (PDF §81): only one live task per device. The MVP
-            # agent checks this before creating the task; this is the race
-            # backstop. DEVICE_BUSY fails the task instead of queueing (§80).
+            # Device lock (PDF §81): only one live task per device. V1.6 P0
+            # 0.9 unifies the DEVICE_BUSY policy: both paths enter the bounded
+            # PENDING wait queue instead of failing the task. pending_since is
+            # NOT reset, so dispatch_pending's max-wait window still converges
+            # a queue that never drains. No fan-out to a second device.
             busy = db.scalars(
                 select(Task.task_id).where(
                     Task.target_device_id == device_id,
@@ -97,13 +99,13 @@ class TaskDispatcher:
                 )
             ).first()
             if busy is not None:
-                task.status = "FAILED"
-                task.finished_at = utcnow()
+                task.status = "PENDING"
                 service._record(
-                    task_id, "task.failed", step_id=step.step_id,
-                    payload={"error_code": "DEVICE_BUSY", "error_message": f"device busy with task {busy}"},
+                    task_id, "task.queued", step_id=step.step_id,
+                    payload={"reason": "DEVICE_BUSY", "blocking_task_id": busy},
                 )
                 db.commit()
+                logger.info("task %s queued: device %s busy with %s", task_id, device_id, busy)
                 return False
 
             if not CapabilityService(db).has_capability(device_id, step.command):
@@ -173,16 +175,18 @@ class TaskDispatcher:
     # ------------------------------------------------------------- capability
 
     async def _dispatch_capability(self, db, service, task: Task, step: TaskStep) -> bool:
-        """Dispatch a CAPABILITY task (V1.4 §21/§51/§65).
+        """Dispatch a CAPABILITY task (V1.4 §21/§51/§65; V1.6 §3.5-§3.7).
 
-        Server resolves capability -> version -> worker (§21), then hands the
-        execution to the worker with package identity so Lazy Pull can verify
-        checksums. Retry/timeout/cancel stay with the Task Engine (§67/§69)."""
+        Server resolves capability -> version -> worker (§21), runs the
+        read-only Preflight (V1.6 0.12 - no attempt is created on failure),
+        then hands the execution to the worker with the pinned package
+        identity (0.13). Retry/timeout/cancel stay with the Task Engine."""
         from app.capability_runtime.errors import CapabilityError, CapabilityNoWorker
         from app.capability_runtime.package_service import PackageService
         from app.capability_runtime.resolver import CapabilityResolver
         from app.capability_runtime.service import CapabilityService
         from app.core.config import settings
+        from app.task.preflight import PreflightFailed, check_capability_dispatch
 
         task_id = task.task_id
         try:
@@ -202,75 +206,64 @@ class TaskDispatcher:
             return False
 
         try:
-            device_id = CapabilityResolver(db).resolve_worker(
+            device_id = CapabilityResolver(db, self.device_link.hub).resolve_worker(
                 task.capability_name, version.version, task.target_device_id
             )
         except CapabilityNoWorker:
-            # Transient: keep dispatchable, monitor sweeps retry within the
-            # offline max-wait window (same policy as legacy offline tasks).
+            # Transient: stay dispatchable, monitor sweeps retry. pending_since
+            # is NOT reset here (V1.6 0.9): the PENDING wait is bounded by the
+            # offline-max-wait window from the last real PENDING entry.
             task.status = "PENDING"
-            task.pending_since = utcnow()
             db.commit()
-            logger.info("capability task %s has no online worker yet; stays PENDING", task_id)
+            logger.info("capability task %s has no eligible worker yet; stays PENDING", task_id)
             return False
 
-        # Device lock (PDF §81) applies to capability executions too.
-        busy = db.scalars(
-            select(Task.task_id).where(
-                Task.target_device_id == device_id,
-                Task.status.in_(LIVE_TASK_STATES),
-                Task.task_id != task_id,
+        # ---- V1.6 P0 0.12: read-only preflight, no attempt burned on failure
+        explicit_device = task.target_device_id is not None
+        try:
+            check_capability_dispatch(
+                db, self.device_link.hub, task, device_id, version,
+                explicit_device=explicit_device,
             )
-        ).first()
-        if busy is not None:
-            task.status = "PENDING"
-            task.pending_since = utcnow()
-            db.commit()
-            logger.info("capability task %s deferred: worker %s busy with %s", task_id, device_id, busy)
-            return False
-
-        if not self.device_link.is_online(device_id):
-            task.status = "PENDING"
-            task.pending_since = utcnow()
-            db.commit()
-            return False
-
-        package = PackageService(db).get_package(version.package_id)
-        # V1.5: per-task timeout override; None falls back to the global default
-        timeout = task.timeout_seconds or settings.capability_default_timeout
-
-        # V1.5 §15/§26: resolve input artifact references into dispatch data.
-        # The Worker downloads over HTTP and verifies each checksum (§54); a
-        # missing artifact row is permanent -> fail the task here, not loop.
-        from app.artifact.service import ArtifactNotFound, ArtifactService
-
-        input_artifacts: list[dict] = []
-        for ref in task.artifact_ids or []:
-            if isinstance(ref, str):  # defensive: legacy plain-id entries
-                ref = {"artifact_id": ref, "role": "input"}
-            try:
-                artifact_row = ArtifactService(db).get_artifact(str(ref.get("artifact_id", "")))
-            except ArtifactNotFound:
-                task.status = "FAILED"
-                task.finished_at = utcnow()
+        except PreflightFailed as exc:
+            transient = exc.code in ("DEVICE_OFFLINE", "DEVICE_BUSY", "AD_STALE")
+            if transient:
+                # Bounded wait queue (0.9): PENDING again, pending_since NOT
+                # reset, so dispatch_pending's window eventually converges.
+                task.status = "PENDING"
+                db.commit()
+                logger.info(
+                    "capability task %s deferred (%s%s); stays PENDING",
+                    task_id, exc.code,
+                    f" blocking={exc.blocking_task_id}" if exc.blocking_task_id else "",
+                )
                 service._record(
-                    task_id, "task.failed",
+                    task_id, "task.queued",
+                    step_id=step.step_id,
                     payload={
-                        "error_code": "ARTIFACT_NOT_FOUND",
-                        "error_message": f"input artifact missing: {ref}",
+                        "reason": exc.code,
+                        "blocking_task_id": exc.blocking_task_id,
                     },
                 )
                 db.commit()
-                logger.warning("capability task %s failed: input artifact missing", task_id)
                 return False
-            input_artifacts.append(
-                {
-                    "artifact_id": str(ref.get("artifact_id", "")),
-                    "name": artifact_row.name,
-                    "checksum": artifact_row.checksum,
-                    "role": str(ref.get("role") or "input"),
-                }
+            task.status = "FAILED"
+            task.finished_at = utcnow()
+            service._record(
+                task_id, "task.failed", step_id=step.step_id,
+                payload={"error_code": exc.code, "error_message": exc.message[:500]},
             )
+            db.commit()
+            logger.warning("capability task %s preflight failed: %s", task_id, exc.code)
+            return False
+
+        package = PackageService(db).get_package(task.package_id or version.package_id)
+        # 0.13: the envelope echoes the Task-row pin; the preflight already
+        # proved the version row and the pin agree (legacy rows without a pin
+        # fall back to the version row they were created from).
+        package_id, checksum = package.package_id, package.checksum
+        # V1.5: per-task timeout override; None falls back to the global default
+        timeout = task.timeout_seconds or settings.capability_default_timeout
 
         attempt = TaskAttempt(
             attempt_id=f"attempt_{new_message_id('a')[2:]}",
@@ -299,9 +292,9 @@ class TaskDispatcher:
                 "version": version.version,
                 "params": step.params,
                 "timeout": timeout,
-                "package_id": package.package_id,
-                "checksum": package.checksum,
-                "input_artifacts": input_artifacts,
+                "package_id": package_id,
+                "checksum": checksum,
+                "input_artifacts": _dispatch_input_artifacts(db, task),
                 "workflow_run_id": task.workflow_run_id,
                 "step_run_id": task.workflow_step_run_id,
             },
@@ -326,7 +319,7 @@ class TaskDispatcher:
             payload={
                 "message_id": envelope.id, "connections": sent,
                 "capability": task.capability_name, "capability_version": version.version,
-                "package_id": package.package_id,
+                "package_id": package_id, "package_checksum": checksum,
             },
         )
         db.commit()
@@ -335,3 +328,29 @@ class TaskDispatcher:
             task_id, step.step_id, task.capability_name, version.version, device_id, attempt.attempt_no,
         )
         return True
+
+
+def _dispatch_input_artifacts(db, task: Task) -> list[dict]:
+    """Resolve input artifact references into dispatch data (V1.5 §15/§26).
+    Existence + ACL were already enforced by the preflight; a row vanishing
+    between preflight and envelope build is a race worth failing loudly."""
+    from app.artifact.service import ArtifactNotFound, ArtifactService
+
+    artifact_service = ArtifactService(db)
+    input_artifacts: list[dict] = []
+    for ref in task.artifact_ids or []:
+        if isinstance(ref, str):  # defensive: legacy plain-id entries
+            ref = {"artifact_id": ref, "role": "input"}
+        try:
+            artifact_row = artifact_service.get_artifact(str(ref.get("artifact_id", "")))
+        except ArtifactNotFound as exc:
+            raise RuntimeError(f"input artifact vanished after preflight: {ref}") from exc
+        input_artifacts.append(
+            {
+                "artifact_id": str(ref.get("artifact_id", "")),
+                "name": artifact_row.name,
+                "checksum": artifact_row.checksum,
+                "role": str(ref.get("role") or "input"),
+            }
+        )
+    return input_artifacts

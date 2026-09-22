@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -42,20 +43,30 @@ def build_package(name: str = "a.b.c", version: str = "1.0.0", runtime: str = "p
 
 
 class FakePuller:
-    """Stand-in for PackagePuller; records calls, optionally injects failure."""
+    """Stand-in for PackagePuller; records calls, optionally injects failure.
+
+    V1.6 P0 0.6: the real puller streams the ZIP to a file and returns its
+    path, so the fake mirrors that file contract (payload written to
+    <work_root>/packages/<package_id>.zip)."""
 
     def __init__(self, payload: bytes | Exception = b"", delay: float = 0.0) -> None:
         self.payload = payload
         self.delay = delay
         self.calls: list[tuple[str, str | None]] = []
 
-    async def download(self, package_id: str, checksum: str | None = None) -> bytes:
+    async def download(self, package_id: str, checksum: str | None = None, cancel=None) -> Path:
+        from worker.capability.puller import packages_root
+
         self.calls.append((package_id, checksum))
         if self.delay:
             await asyncio.sleep(self.delay)
         if isinstance(self.payload, Exception):
             raise self.payload
-        return self.payload
+        root = packages_root()
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{package_id}.zip"
+        path.write_bytes(self.payload)
+        return path
 
 
 # -------------------------------------------------------------------- manifest
@@ -238,11 +249,11 @@ async def test_ensure_install_failure_code(tmp_path, monkeypatch):
     data = build_package()
     puller = FakePuller(data)
 
-    def broken_install(name, version, checksum, zip_bytes):
+    def broken_install(name, version, checksum, zip_path):
         raise InstallFailed("disk on fire")
 
     cache = CapabilityCache(tmp_path / "caps")
-    monkeypatch.setattr(cache, "install", broken_install)
+    monkeypatch.setattr(cache, "install_from_file", broken_install)
     manager = CapabilityManager(cache, puller)
     with pytest.raises(CapabilityInstallError) as exc_info:
         await manager.ensure("a.b.c", "1.0.0", "pkg_1", sha256_bytes(data))

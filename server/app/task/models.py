@@ -80,6 +80,13 @@ class TaskOut(BaseModel):
     priority: int
     max_attempts: int
     timeout_seconds: int | None = None
+    # V1.6 P0 0.13/0.17: the pin is visible for the run history (who / which
+    # machine / which package identity).
+    source_type: str | None = None
+    capability_name: str | None = None
+    capability_version: str | None = None
+    package_id: str | None = None
+    package_checksum: str | None = None
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None

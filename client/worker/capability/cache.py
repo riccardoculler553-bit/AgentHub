@@ -64,6 +64,20 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Incremental SHA-256 of a file on disk (V1.6 P0 0.6)."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class CapabilityCache:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or capabilities_root()
@@ -128,12 +142,51 @@ class CapabilityCache:
             raise InstallFailed(f"{name}@{version}: install failed: {exc}") from exc
         return Install(name, version, marker["checksum"], final, manifest)
 
+    def install_from_file(
+        self, name: str, version: str, checksum: str | None, zip_path: Path
+    ) -> Install:
+        """V1.6 P0 0.6: file-backed twin of install - the ZIP is validated and
+        extracted straight from disk, never fully held in memory. Caller must
+        hold the per-(name, version) package lock (manager guarantees this)."""
+        manifest = _validate_zip_path(zip_path, name, version)
+        final = self.install_dir(name, version)
+        try:
+            staging = self._extract_staged_from_path(zip_path, name, version)
+            marker = {
+                "name": name,
+                "version": version,
+                "checksum": checksum or sha256_file(zip_path),
+                "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            (staging / MARKER_FILE).write_text(
+                json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            if final.exists():
+                shutil.rmtree(final)
+            final.parent.mkdir(parents=True, exist_ok=True)  # os.replace won't create it
+            os.replace(staging, final)
+        except OSError as exc:
+            raise InstallFailed(f"{name}@{version}: install failed: {exc}") from exc
+        return Install(name, version, marker["checksum"], final, manifest)
+
     def _extract_staged(self, zip_bytes: bytes, name: str, version: str) -> Path:
         tmp_root = self.root / ".tmp"
         tmp_root.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=f"{name}.{version}.", dir=str(tmp_root)))
         try:
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                zf.extractall(staging)
+        except (zipfile.BadZipFile, OSError) as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise InstallFailed(f"{name}@{version}: extract failed: {exc}") from exc
+        return staging
+
+    def _extract_staged_from_path(self, zip_path: Path, name: str, version: str) -> Path:
+        tmp_root = self.root / ".tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f"{name}.{version}.", dir=str(tmp_root)))
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
                 zf.extractall(staging)
         except (zipfile.BadZipFile, OSError) as exc:
             shutil.rmtree(staging, ignore_errors=True)
@@ -147,15 +200,28 @@ def _validate_zip(zip_bytes: bytes, expected_name: str, expected_version: str) -
         raise InvalidPackage("empty package")
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            names = zf.namelist()
-            if MANIFEST_FILE not in names:
-                raise InvalidPackage(f"missing {MANIFEST_FILE} at the archive root")
-            raw = zf.read(MANIFEST_FILE)
-            for entry in names:  # zip-slip defense
-                if entry.startswith("/") or ".." in entry.replace("\\", "/").split("/"):
-                    raise InvalidPackage(f"unsafe archive entry: {entry}")
+            return _validate_zipfile(zf, expected_name, expected_version)
     except zipfile.BadZipFile as exc:
         raise InvalidPackage("not a valid ZIP archive") from exc
+
+
+def _validate_zip_path(zip_path: Path, expected_name: str, expected_version: str) -> Manifest:
+    """V1.6 P0 0.6: file-backed twin of _validate_zip."""
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            return _validate_zipfile(zf, expected_name, expected_version)
+    except zipfile.BadZipFile as exc:
+        raise InvalidPackage("not a valid ZIP archive") from exc
+
+
+def _validate_zipfile(zf: zipfile.ZipFile, expected_name: str, expected_version: str) -> Manifest:
+    names = zf.namelist()
+    if MANIFEST_FILE not in names:
+        raise InvalidPackage(f"missing {MANIFEST_FILE} at the archive root")
+    raw = zf.read(MANIFEST_FILE)
+    for entry in names:  # zip-slip defense
+        if entry.startswith("/") or ".." in entry.replace("\\", "/").split("/"):
+            raise InvalidPackage(f"unsafe archive entry: {entry}")
     try:
         manifest = parse_manifest_bytes(raw)
     except ValueError as exc:

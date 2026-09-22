@@ -98,7 +98,28 @@ async def device_ws(websocket: WebSocket):
                 continue
 
             connection.mark_activity()
-            await _dispatch(connection, envelope)
+            # V1.6 P0 0.4: a poisoned envelope must not kill the whole
+            # connection (audit: one bad DB write turned into 1011 and the
+            # device dropped offline mid-task). Report and keep reading.
+            try:
+                await _dispatch(connection, envelope)
+            except Exception:
+                logger.exception(
+                    "connection %s failed to handle %s envelope %s",
+                    connection.connection_id,
+                    envelope.type,
+                    envelope.id,
+                )
+                try:
+                    await connection.send(
+                        Envelope(
+                            id=envelope.id,
+                            type=MessageType.ERROR,
+                            data={"code": "internal_error", "message": "envelope handling failed; connection kept"},
+                        )
+                    )
+                except Exception:
+                    logger.exception("connection %s failed to send error envelope", connection.connection_id)
             _touch_device(connection.device_id)
     except WebSocketDisconnect as exc:
         close_code = exc.code or 1000

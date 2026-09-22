@@ -71,7 +71,9 @@ class CapabilityManager:
                 )
             self.states[key] = "DOWNLOADING"
             try:
-                data = await self.puller.download(package_id, checksum)
+                # V1.6 P0 0.6: the puller streams to a file; no whole-archive
+                # bytes ever sit in memory.
+                zip_path = await self.puller.download(package_id, checksum)
             except ChecksumFailed as exc:
                 self.states[key] = "NONE"
                 raise CapabilityInstallError("CHECKSUM_FAILED", str(exc)) from exc
@@ -81,7 +83,9 @@ class CapabilityManager:
 
             try:
                 # Extract is blocking FS work; keep the loop responsive.
-                installed = await asyncio.to_thread(self.cache.install, name, version, checksum, data)
+                installed = await asyncio.to_thread(
+                    self.cache.install_from_file, name, version, checksum, zip_path
+                )
             except InvalidPackage as exc:
                 self.states[key] = "NONE"
                 raise CapabilityInstallError("INVALID_PACKAGE", str(exc)) from exc

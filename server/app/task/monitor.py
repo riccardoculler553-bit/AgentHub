@@ -45,6 +45,7 @@ class TaskMonitor:
             try:
                 await self.dispatch_pending()
                 await self.timeout_scan()
+                await self.accepted_liveness_scan()
                 await self.reconcile_stale()
             except Exception:
                 logger.exception("task monitor sweep failed")
@@ -95,17 +96,56 @@ class TaskMonitor:
             # a bounded wait too (offline max wait), not the full timeout -
             # TIMEOUT is retryable, an ACCEPTED-forever state is not.
             max_wait = timedelta(seconds=settings.task_offline_max_wait)
+            sent_offline_timed_out: list[str] = []
             for task in db.scalars(select(Task).where(Task.status == "SENT")):
                 if task.target_device_id and not self.hub.is_device_online(task.target_device_id):
                     attempts = svc.get_attempts(task.task_id)
                     last_dispatch = max((a.created_at for a in attempts), default=None)
                     if last_dispatch is not None and now - last_dispatch > max_wait:
-                        svc.timeout_running(task)
+                        result = svc.timeout_running(task)
+                        if result.get("notify_device") or result.get("status") == "TIMEOUT":
+                            sent_offline_timed_out.append(task.task_id)
             expired = [svc.timeout_running(task) for task in live]
         for result in expired:
             if not result.get("notify_device"):
                 continue  # lost the CAS: a result path closed the task already
             logger.warning("task %s TIMEOUT (watchdog)", result["task_id"])
+            await self._send_cancel(result["task_id"], result.get("attempt_id"), result.get("step_id"))
+        # V1.6 P0 0.14 (§3.7): "SENT, never accepted, link died" is an
+        # auto-retry case for READ capabilities - nothing executed.
+        with SessionLocal() as db:
+            svc = TaskService(db)
+            for task_id in sent_offline_timed_out:
+                svc.maybe_auto_retry(task_id, sent_unaccepted=True)
+
+    async def accepted_liveness_scan(self) -> None:
+        """V1.6 P0 0.1: ACCEPTED is not RUNNING (the worker enqueues on accept,
+        dequeues later). An attempt that stays ACCEPTED past the liveness
+        window without ever reporting task.running is converged to TIMEOUT
+        (ACCEPTED_STALLED) instead of sitting until timeout_at - the audit H3
+        zombie-queue hole (sub-computer worker restarted mid-queue)."""
+        window = timedelta(seconds=settings.task_accepted_liveness)
+        results: list[dict] = []
+        with SessionLocal() as db:
+            svc = TaskService(db)
+            now = utcnow()
+            for task in db.scalars(select(Task).where(Task.status == "ACCEPTED")):
+                stalled = any(
+                    attempt.status == "ACCEPTED"
+                    and attempt.accepted_at is not None
+                    and now - attempt.accepted_at > window
+                    for attempt in svc.get_attempts(task.task_id)
+                )
+                if stalled:
+                    results.append(svc.timeout_accepted_stalled(task))
+        for result in results:
+            if not result.get("notify_device"):
+                continue  # lost the CAS: the task is not ACCEPTED anymore
+            logger.warning(
+                "task %s TIMEOUT (accepted_stalled, attempt %s)",
+                result["task_id"],
+                result.get("attempt_id"),
+            )
             await self._send_cancel(result["task_id"], result.get("attempt_id"), result.get("step_id"))
 
     async def notify_cancel(self, task_id: str) -> None:

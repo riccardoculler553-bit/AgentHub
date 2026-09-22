@@ -38,8 +38,13 @@ class DeviceService:
         device = self.get_device(device_id)
         self.tokens.revoke_for_device(device.device_id)
         self.repo.set_revoked(device.device_id)
+        # V1.6 P0 0.10 (audit: forget_worker was dead code): a revoked device's
+        # capability ads must not linger as phantom install state.
+        from app.capability_runtime.worker_registry import WorkerCapabilityService
 
-    def to_out(self, device: Device, connection_count: int = 0) -> DeviceOut:
+        WorkerCapabilityService(self.db).forget_worker(device.device_id)
+
+    def to_out(self, device: Device, connection_count: int = 0, live_tasks: int = 0) -> DeviceOut:
         return DeviceOut(
             device_id=device.device_id,
             name=device.name,
@@ -55,4 +60,8 @@ class DeviceService:
             # connection. DB status is the grace-period view kept by the
             # HeartbeatMonitor and deliberately lags behind socket loss.
             online=connection_count > 0,
+            # V1.6 P0 0.8: scheduling is a separate axis from connectivity.
+            # READY = may take a new task now; BUSY = already executing one
+            # (max_concurrency=1 for GUI/RPA sessions). DRAINING is P1.
+            scheduling_state="BUSY" if live_tasks > 0 else "READY",
         )

@@ -113,3 +113,33 @@ def test_revoked_token_closes_with_4403(client, registered_device):
             ws.receive_json()
     except WebSocketDisconnect as exc:
         assert exc.code == 4403
+
+
+def test_poisoned_envelope_does_not_kill_connection(client, registered_device, monkeypatch):
+    """V1.6 P0 0.4: one failing envelope handler answers error and the
+    connection keeps serving later envelopes (no 1011 teardown)."""
+    from app.api import websocket as ws_module
+
+    token = registered_device["device_token"]
+    real_dispatch = ws_module._dispatch
+
+    async def poisoned_dispatch(connection, envelope):
+        if envelope.type == "message":
+            raise RuntimeError("simulated poisoned handler")
+        await real_dispatch(connection, envelope)
+
+    monkeypatch.setattr(ws_module, "_dispatch", poisoned_dispatch)
+
+    with client.websocket_connect("/api/ws/device", headers=_auth_headers(token)) as ws:
+        ws.receive_json()  # device.connected
+
+        ws.send_json({"id": "evt_bad", "type": "message", "version": 1, "timestamp": 1, "data": {}})
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["data"]["code"] == "internal_error"
+
+        # connection still alive: heartbeat round trip works afterwards
+        ws.send_json({"id": "evt_hb_2", "type": "heartbeat", "version": 1, "timestamp": 1, "data": {"seq": 2}})
+        ack = ws.receive_json()
+        assert ack["type"] == "heartbeat_ack"
+        assert ack["id"] == "evt_hb_2"

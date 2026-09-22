@@ -19,7 +19,7 @@ from app.task import models as schemas
 from app.task.db_models import Task
 from app.task.service import TaskService
 
-from ._worker import FakeWorker, register_device, wait_for_capabilities
+from ._worker import FakeWorker, register_device, wait_for_capabilities, wait_until
 
 
 @pytest.fixture()
@@ -128,9 +128,11 @@ def test_default_registry_has_standard_tools(registry):
         assert tool.requires_confirmation is confirm, name
     # wait-type tools never let the LLM poll (PDF §44)
     assert registry.get("retry_task").waits_task
-    assert registry.get("execute_command").waits_task
     assert registry.get("run_workflow").waits_task
     assert registry.get("run_capability").waits_task
+    # V1.6 0.16: execute_command is async now - it never held the loop as a
+    # 1900s waiter, so waits_task must stay False.
+    assert not registry.get("execute_command").waits_task
 
 
 # --------------------------------------------------------------------- device
@@ -260,20 +262,56 @@ async def test_execute_command_full_loop_with_worker(registry, client, device):
             {"command": "echo", "device_name": "工具测试机", "params": {"message": "v1.2"}},
         )
         assert r.success, r
-        assert r.data["status"] == "SUCCESS"
         assert r.data["device_name"] == "工具测试机"
-        assert r.data["result"]["payload"]["result"]["echo"] == "v1.2"
+        # V1.6 0.16: async contract - the tool returns right after dispatch
+        # with the live task status, never a terminal wait.
+        assert r.data["status"] in ("PENDING", "DISPATCHING", "SENT", "ACCEPTED", "RUNNING")
+        assert wait_until(
+            lambda: _get_task(r.data["task_id"]).status == "SUCCESS"
+        ), _get_task(r.data["task_id"]).status
     finally:
         worker.stop()
 
 
 @pytest.mark.anyio
-async def test_execute_command_busy_device(registry, device):
-    _create_echo_task(device["device_id"])  # live task -> busy
-    r = await _call(
-        registry, "execute_command", {"command": "echo", "device_name": "工具测试机"}
-    )
-    assert not r.success and r.error_code == ToolErrorCodes.DEVICE_BUSY
+async def test_execute_command_busy_device_queues(registry, client, device):
+    """V1.6 0.9: a busy device no longer fails the tool call - the task
+    enters the bounded PENDING wait queue instead (unified DEVICE_BUSY)."""
+    # "silent" keeps the connection open without ever answering: the first
+    # task stays live and blocks the device for the whole test.
+    worker = FakeWorker(client, device["device_token"], capabilities=("echo",), behaviour="silent")
+    worker.start()
+    try:
+        assert wait_for_capabilities(client, device["device_id"], ("echo",))
+        first = await _call(
+            registry,
+            "execute_command",
+            {"command": "echo", "device_name": "工具测试机", "params": {"message": "hi"}},
+        )
+        assert first.success, first
+        blocking = first.data["task_id"]
+        assert wait_until(lambda: (_get_task(blocking) or Task()).status == "SENT")
+
+        second = await _call(
+            registry,
+            "execute_command",
+            {"command": "echo", "device_name": "工具测试机", "params": {"message": "hi2"}},
+        )
+        assert second.success, second
+        new_task_id = second.data["task_id"]
+        assert new_task_id != blocking
+        with SessionLocal() as db:
+            from app.task.db_models import TaskEvent
+
+            queued = db.scalars(
+                select(TaskEvent).where(
+                    TaskEvent.task_id == new_task_id, TaskEvent.event_type == "task.queued"
+                )
+            ).all()
+            assert queued, "expected a task.queued audit event"
+            assert queued[0].payload.get("blocking_task_id") == blocking
+    finally:
+        worker.stop()
 
 
 @pytest.mark.anyio

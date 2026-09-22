@@ -35,6 +35,12 @@ class Task(Base):
     execution_type: Mapped[str] = mapped_column(String(16), default="LEGACY_COMMAND")
     capability_name: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     capability_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # V1.6 P0 0.13: the pin is complete only with package identity on the Task
+    # row - name+version+package_id+checksum must agree with the dispatch
+    # envelope and be queryable for the run history (they used to live only
+    # in the transient envelope).
+    package_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    package_checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # artifact ids produced by this task (uploaded via the Artifact plane, §45)
     artifact_ids: Mapped[list] = mapped_column(JSON, default=list)
     priority: Mapped[int] = mapped_column(Integer, default=0)

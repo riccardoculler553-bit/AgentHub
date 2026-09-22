@@ -65,6 +65,8 @@ def _device_brief(device: Device, hub: Any, busy_ids: set[str]) -> dict:
         "device_id": device.device_id,
         "name": device.name,
         "online": bool(hub.is_device_online(device.device_id)) if hub else False,
+        # V1.6 P0 0.8: dual-axis - connectivity (online) vs scheduling (READY/BUSY)
+        "scheduling_state": "BUSY" if device.device_id in busy_ids else "READY",
         "busy": device.device_id in busy_ids,
         "platform": device.platform,
         "status": device.status,
@@ -90,6 +92,12 @@ def register_device_tools(registry: ToolRegistry, hub: Any = None) -> None:
         if err:
             return err
         caps = CapabilityService(db).get_device_capabilities(device.device_id)
+        # V1.6 P0 0.11: surface the NEW worker_capabilities plane too - the
+        # installed automation packages (with freshness) are what the
+        # capability resolver actually selects on, not the legacy commands.
+        from app.capability_runtime.worker_registry import WorkerCapabilityService
+
+        installed = WorkerCapabilityService(db).get_worker_capabilities(device.device_id)
         return ToolResult.ok(
             {
                 "device_id": device.device_id,
@@ -97,6 +105,15 @@ def register_device_tools(registry: ToolRegistry, hub: Any = None) -> None:
                 "capabilities": [
                     {"command": c.command_name, "version": c.version, "enabled": c.enabled}
                     for c in caps
+                ],
+                "installed_packages": [
+                    {
+                        "name": i.capability_name,
+                        "version": i.version,
+                        "status": i.status,
+                        "last_seen_at": i.last_seen_at.isoformat() if i.last_seen_at else None,
+                    }
+                    for i in installed
                 ],
             }
         )

@@ -78,7 +78,7 @@
 </head>
 <body>
 <h1>AgentHub</h1>
-<div class="sub">DeviceLink 中台 · 任务控制与智能编排 · V1.0</div>
+<div class="sub">DeviceLink 中台 · Fleet Execution 执行池 · V1.6</div>
 <div class="admin" id="adminBar">
   <span id="adminState" class="off">Admin Token 未设置</span>
   <input type="text" id="adminToken" placeholder="AGENTHUB_ADMIN_TOKEN（X-Admin-Token）" style="min-width:280px">
@@ -109,9 +109,9 @@
   <table>
     <thead>
       <tr><th>设备</th><th>Device ID</th><th>平台</th><th>主机名</th>
-          <th>状态</th><th>连接数</th><th>最后心跳</th><th>版本</th><th>操作</th></tr>
+          <th>连通性</th><th>调度态</th><th>连接数</th><th>最后心跳</th><th>版本</th><th>操作</th></tr>
     </thead>
-    <tbody id="deviceRows"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+    <tbody id="deviceRows"><tr><td colspan="10" class="empty">加载中…</td></tr></tbody>
   </table>
 </section>
 
@@ -128,10 +128,10 @@
   </div>
   <table>
     <thead>
-      <tr><th>Task ID</th><th>名称</th><th>目标设备</th><th>状态</th>
+      <tr><th>Task ID</th><th>名称</th><th>目标设备</th><th>状态</th><th>能力 / 版本</th><th>来源</th>
           <th>创建</th><th>结束</th><th>操作</th></tr>
     </thead>
-    <tbody id="taskRows"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+    <tbody id="taskRows"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
   </table>
 </section>
 
@@ -146,10 +146,16 @@
 
 <!-- ============================== 能力 ============================== -->
 <section id="tab-capabilities" style="display:none">
-  <div class="toolbar"><button class="ghost" onclick="refreshCapabilities()">刷新</button></div>
+  <div class="toolbar"><button class="ghost" onclick="refreshCapabilities()">刷新</button>
+    <span class="muted">平台能力目录（/api/capabilities）与 Worker 安装态（/api/worker-capabilities，含广告时间）</span></div>
   <table>
-    <thead><tr><th>设备</th><th>上报能力</th></tr></thead>
-    <tbody id="capRows"><tr><td colspan="2" class="empty">加载中…</td></tr></tbody>
+    <thead><tr><th>能力</th><th>运行时</th><th>当前版本</th><th>风险</th><th>启用</th></tr></thead>
+    <tbody id="capRows"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+  </table>
+  <div class="section-title">Worker 安装态（worker.capabilities 广告）</div>
+  <table>
+    <thead><tr><th>Worker</th><th>已安装能力包</th></tr></thead>
+    <tbody id="workerCapRows"><tr><td colspan="2" class="empty">加载中…</td></tr></tbody>
   </table>
 </section>
 
@@ -283,29 +289,35 @@ async function refreshDevices() {
     const devices = await api("/api/devices").then(r => r.json());
     const tbody = document.getElementById("deviceRows");
     if (!devices.length) {
-      tbody.innerHTML = '<tr><td colspan="9" class="empty">还没有设备，先创建注册码吧</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="10" class="empty">还没有设备，先创建注册码吧</td></tr>';
       return;
     }
     tbody.innerHTML = devices.map(d => {
-      const cls = d.status === "online" ? "online" : (d.status === "revoked" ? "revoked" : "offline");
+      /* V1.6 双轴状态：连通性 = Hub 连接（dot），调度态 = READY/BUSY（徽章） */
+      const online = d.online || d.connection_count > 0;
+      const cls = d.status === "revoked" ? "revoked" : (online ? "online" : "offline");
+      const sched = d.scheduling_state || "READY";
       return `<tr class="${cls}">
         <td><span class="dot"></span><b>${esc(d.name)}</b></td>
         <td class="mono muted">${esc(d.device_id.slice(0,8))}…</td>
         <td>${esc(d.platform || "-")}</td>
         <td>${esc(d.hostname || "-")}</td>
-        <td>${esc(d.status.toUpperCase())}</td>
+        <td>${d.status === "revoked" ? badge("REVOKED") : (online ? "ONLINE" : "OFFLINE")}</td>
+        <td>${d.status === "revoked" ? '<span class="muted">-</span>'
+              : (sched === "BUSY" ? '<span class="badge b-RUNNING">BUSY</span>'
+                                  : '<span class="badge b-SUCCESS">READY</span>')}</td>
         <td>${d.connection_count}</td>
         <td>${fmtTime(d.last_seen_at)}</td>
         <td class="mono">${esc(d.client_version || "-")}</td>
         <td class="actions">
-          ${d.status === "online" ? `<button onclick="sendMessage('${d.device_id}','${esc(d.name)}')">发消息</button>` : ""}
+          ${online ? `<button onclick="sendMessage('${d.device_id}','${esc(d.name)}')">发消息</button>` : ""}
           ${d.status !== "revoked" ? `<button class="danger" onclick="revoke('${d.device_id}','${esc(d.name)}')">撤销</button>` : ""}
         </td>
       </tr>`;
     }).join("");
   } catch (e) {
     document.getElementById("deviceRows").innerHTML =
-      `<tr><td colspan="9" class="empty">${esc(e.message || "无法连接服务器")}</td></tr>`;
+      `<tr><td colspan="10" class="empty">${esc(e.message || "无法连接服务器")}</td></tr>`;
   }
 }
 
@@ -346,7 +358,7 @@ async function refreshTasks() {
   try {
     const tasks = await api("/api/tasks" + qs).then(r => r.json());
     if (!tasks.length) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无任务，可在 Agent 页用自然语言下发</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">暂无任务，可在 Agent 页用自然语言下发</td></tr>';
       return;
     }
     tbody.innerHTML = tasks.map(t => `
@@ -354,7 +366,9 @@ async function refreshTasks() {
         <td class="mono">${esc(t.task_id.slice(0, 14))}…</td>
         <td>${esc(t.name)}</td>
         <td class="mono muted">${esc((t.target_device_id || "-").slice(0, 8))}${t.target_device_id ? "…" : ""}</td>
-        <td>${badge(t.status)}</td>
+        <td>${badge(t.status)}${t.status === "ACCEPTED" ? '<div class="muted" style="font-size:11px">已入队未执行</div>' : ""}</td>
+        <td class="mono">${esc(t.capability_name || "-")}${t.capability_version ? " @v" + esc(t.capability_version) : ""}</td>
+        <td>${esc(t.source_type || "-")}</td>
         <td>${fmtTime(t.created_at)}</td>
         <td>${t.finished_at ? fmtTime(t.finished_at) : "-"}</td>
         <td class="actions" onclick="event.stopPropagation()">
@@ -366,7 +380,7 @@ async function refreshTasks() {
         </td>
       </tr>`).join("");
   } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="7" class="empty">${esc(e.message)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="empty">${esc(e.message)}</td></tr>`;
   }
 }
 async function cancelTask(id) {
@@ -387,7 +401,10 @@ async function openTask(id) {
   document.getElementById("tmBody").innerHTML = `
     <div class="kv">
       <div class="k">名称</div><div>${esc(t.name)}</div>
+      <div class="k">来源</div><div>${esc(t.source_type || "-")}</div>
       <div class="k">目标设备</div><div class="mono">${esc(t.target_device_id || "-")}</div>
+      <div class="k">能力 / 版本</div><div class="mono">${esc(t.capability_name || "-")}${t.capability_version ? " @ v" + esc(t.capability_version) : ""}</div>
+      <div class="k">包 Pin (0.13)</div><div class="mono">${esc(t.package_id || "-")}${t.package_checksum ? `<br>sha256 ${esc(t.package_checksum.slice(0,16))}…` : ""}</div>
       <div class="k">优先级 / 最大尝试</div><div>${t.priority} / ${t.max_attempts}</div>
       <div class="k">创建</div><div>${fmtAbs(t.created_at)}</div>
       <div class="k">开始</div><div>${fmtAbs(t.started_at)}</div>
@@ -403,14 +420,19 @@ async function openTask(id) {
         <td>${badge(s.status)}</td><td>${fmtAbs(s.started_at)}</td><td>${fmtAbs(s.finished_at)}</td>
       </tr>`).join("") || '<tr><td colspan="7" class="empty">无</td></tr>'}</tbody></table>
     <div class="section-title">尝试（Attempts）</div>
-    <table><thead><tr><th>#</th><th>Step</th><th>设备</th><th>状态</th><th>错误码</th><th>错误信息</th></tr></thead>
-    <tbody>${t.attempts.map(a => `<tr>
+    <table><thead><tr><th>#</th><th>Step</th><th>设备</th><th>状态</th><th>进度</th><th>错误码</th><th>错误信息</th></tr></thead>
+    <tbody>${t.attempts.map(a => {
+      const p = a.progress || {};
+      const pct = (p.progress ?? p.progress === 0) ? `${p.progress}%` : "";
+      return `<tr>
         <td>${a.attempt_no}</td><td class="mono">${esc((a.step_id||"").slice(0,12))}…</td>
         <td class="mono">${esc((a.device_id||"-").slice(0,8))}</td>
         <td>${badge(a.status)}</td>
+        <td class="mono">${pct ? `<b>${pct}</b> ` : ""}${esc(p.message || "")}</td>
         <td class="mono">${esc(a.error_code || "-")}</td>
         <td>${esc(a.error_message || "-")}</td>
-      </tr>`).join("") || '<tr><td colspan="6" class="empty">无</td></tr>'}</tbody></table>
+      </tr>`;
+    }).join("") || '<tr><td colspan="7" class="empty">无</td></tr>'}</tbody></table>
     <div class="section-title">事件时间线</div>
     <ul class="timeline">
       ${t.events.slice().reverse().map(e => `<li>
@@ -450,18 +472,35 @@ async function refreshCommands() {
 /* ============================== 能力 ============================== */
 async function refreshCapabilities() {
   const tbody = document.getElementById("capRows");
+  const wtbody = document.getElementById("workerCapRows");
   try {
-    const groups = await api("/api/device-capabilities").then(r => r.json());
-    if (!groups.length) {
-      tbody.innerHTML = '<tr><td colspan="2" class="empty">设备尚未上报能力（Worker 连接后自动上报）</td></tr>';
+    /* V1.6 0.11: the registry lives at /api/capabilities (new plane) -
+       device-capabilities remains the legacy per-command ad view. */
+    const caps = await api("/api/capabilities").then(r => r.json());
+    if (!caps.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">平台还没有注册能力</td></tr>';
+    } else {
+      tbody.innerHTML = caps.map(c => `<tr>
+        <td><code class="mono">${esc(c.name)}</code><div class="muted" style="font-size:11px">${esc(c.display_name || "")}</div></td>
+        <td>${esc(c.runtime_type)}</td>
+        <td class="mono">${esc(c.current_version || "-")}</td>
+        <td>${esc(c.risk_level || "-")}</td>
+        <td>${c.enabled ? "✔" : "✘"}</td>
+      </tr>`).join("");
+    }
+    const workers = await api("/api/worker-capabilities").then(r => r.json());
+    if (!workers.length) {
+      wtbody.innerHTML = '<tr><td colspan="2" class="empty">Worker 连接后会自动上报已安装能力包</td></tr>';
       return;
     }
-    tbody.innerHTML = groups.map(g => `<tr>
-      <td class="mono">${esc(g.device_id)}</td>
-      <td>${g.capabilities.map(c => `<span class="chip">${esc(c.name)} v${esc(c.version)}</span>`).join("")}</td>
+    wtbody.innerHTML = workers.map(w => `<tr>
+      <td class="mono">${esc(w.worker_id)}</td>
+      <td>${(w.capabilities || []).map(c =>
+        `<span class="chip" title="广告时间 ${esc(c.last_seen_at || "-")}">${esc(c.name)} v${esc(c.version)} · ${esc(c.status || "")}</span>`
+      ).join("") || '<span class="muted">无</span>'}</td>
     </tr>`).join("");
   } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="2" class="empty">${esc(e.message)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">${esc(e.message)}</td></tr>`;
   }
 }
 

@@ -56,6 +56,11 @@ class Settings:
         # Admin token for dashboard/management APIs (X-Admin-Token), separate
         # from device tokens. Empty disables admin auth (local dev only).
         self.admin_token = os.getenv("AGENTHUB_ADMIN_TOKEN", "")
+        # V1.6 P0 0.18: RBAC role tokens (hierarchical: admin > operator >
+        # viewer). Empty = role not configured; the loopback open-mode bypass
+        # only applies when ALL role tokens are empty.
+        self.operator_token = os.getenv("AGENTHUB_OPERATOR_TOKEN", "")
+        self.viewer_token = os.getenv("AGENTHUB_VIEWER_TOKEN", "")
         self.task_offline_max_wait = int(os.getenv("TASK_OFFLINE_MAX_WAIT", "600"))
         self.task_max_attempts = int(os.getenv("TASK_MAX_ATTEMPTS", "3"))
         # Main Agent LLM (OpenAI-compatible)
@@ -114,6 +119,15 @@ class Settings:
         self.task_cancel_resend_window = int(os.getenv("TASK_CANCEL_RESEND_WINDOW", "600"))
         # Worker-side package pull retry budget (§67: 最多重试 2 次).
         self.capability_pull_max_retries = int(os.getenv("CAPABILITY_PULL_MAX_RETRIES", "2"))
+        # V1.6 P0 0.1 (audit H3): ACCEPTED liveness window - an attempt that
+        # stays ACCEPTED (accepted but never running) this many seconds after
+        # accepted_at is converged to TIMEOUT/ACCEPTED_STALLED instead of
+        # sitting until timeout_at (capability default 1800s).
+        self.task_accepted_liveness = int(os.getenv("TASK_ACCEPTED_LIVENESS", "90"))
+        # V1.6 P0 0.10: worker_capabilities ads older than this TTL are not
+        # trusted for worker selection (the worker re-reports on every
+        # connect, so healthy ads are refreshed far more often).
+        self.worker_ad_ttl = int(os.getenv("WORKER_AD_TTL", "86400"))
 
 
 settings = Settings()

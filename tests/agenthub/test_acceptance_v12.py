@@ -135,18 +135,29 @@ async def test_scenario_1_run_command(client, hub, registry, device):
             ),
             dec("finish", answer="已在验收机A执行完成，结果：验收通过。"),
         ).run("帮我在验收机A上执行 echo 验收通过")
+
+        assert final["error"] is None
+        assert final["reply"] == "已在验收机A执行完成，结果：验收通过。"
+        result = final["tool_result"]
+        # V1.6 0.16: execute_command returns right after dispatch (async
+        # contract) - the task must reach terminal while the worker is still
+        # connected, so poll inside the try block.
+        assert result["success"] is True
+        assert result["data"]["status"] in ("PENDING", "DISPATCHING", "SENT", "ACCEPTED", "RUNNING")
+        deadline = __import__("time").monotonic() + 10
+        status = None
+        while __import__("time").monotonic() < deadline:
+            with SessionLocal() as db:
+                task = db.scalars(
+                    select(Task).where(Task.task_id == result["data"]["task_id"])
+                ).first()
+            status = task.status if task is not None else None
+            if status == "SUCCESS":
+                break
+            __import__("time").sleep(0.2)
     finally:
         worker.stop()
-
-    assert final["error"] is None
-    assert final["reply"] == "已在验收机A执行完成，结果：验收通过。"
-    result = final["tool_result"]
-    assert result["success"] is True and result["data"]["status"] == "SUCCESS"
-    with SessionLocal() as db:
-        task = db.scalars(
-            select(Task).where(Task.task_id == result["data"]["task_id"])
-        ).first()
-        assert task is not None and task.status == "SUCCESS"
+    assert status == "SUCCESS", status
 
 
 # ------------------------------------------------------- 2. 查询审单结果 (READ)

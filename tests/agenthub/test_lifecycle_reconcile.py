@@ -257,6 +257,152 @@ def test_sent_offline_task_times_out_after_max_wait(client):
         assert db.scalars(select(Task).where(Task.task_id == task_id)).first().status == "TIMEOUT"
 
 
+# ------------------------------------------------- V1.6 P0 0.1 ACCEPTED liveness
+
+
+def _plant_accepted_attempt(device_id: str, *, attempt_status: str = "ACCEPTED"):
+    task_id, attempt_id = _plant_attempt(
+        device_id, task_status="ACCEPTED", attempt_status=attempt_status
+    )
+    with SessionLocal() as db:
+        row = db.scalars(select(TaskAttempt).where(TaskAttempt.attempt_id == attempt_id)).first()
+        row.accepted_at = utcnow() - timedelta(seconds=settings.task_accepted_liveness + 60)
+        # an accepted-but-never-running attempt leaves its step PENDING
+        step = db.scalars(select(TaskStep).where(TaskStep.step_id == row.step_id)).first()
+        step.status = "PENDING"
+        db.commit()
+    return task_id, attempt_id
+
+
+def test_accepted_stalled_task_converges_after_liveness_window(client):
+    """V1.6 P0 0.1 (audit H3): ACCEPTED past the liveness window without ever
+    reporting task.running -> TIMEOUT/ACCEPTED_STALLED, not 1800s of silence."""
+    device = register_device(client, "活性机A")
+    task_id, attempt_id = _plant_accepted_attempt(device["device_id"])
+
+    monitor = TaskMonitor(client.app.state.hub)
+    asyncio.run(monitor.accepted_liveness_scan())
+
+    with SessionLocal() as db:
+        task = db.scalars(select(Task).where(Task.task_id == task_id)).first()
+        assert task.status == "TIMEOUT"
+        attempt = db.scalars(select(TaskAttempt).where(TaskAttempt.attempt_id == attempt_id)).first()
+        assert attempt.status == "TIMEOUT"
+        assert attempt.error_code == "ACCEPTED_STALLED"
+    assert _events(task_id, "task.timeout")
+    # TIMEOUT is retryable: an operator can re-enter PENDING
+    res = client.post(f"/api/tasks/{task_id}/retry")
+    assert res.status_code == 200
+    with SessionLocal() as db:
+        assert db.scalars(select(Task).where(Task.task_id == task_id)).first().status == "PENDING"
+
+
+def test_accepted_within_liveness_window_untouched(client):
+    device = register_device(client, "活性机B")
+    task_id, attempt_id = _plant_attempt(
+        device["device_id"], task_status="ACCEPTED", attempt_status="ACCEPTED"
+    )
+    monitor = TaskMonitor(client.app.state.hub)
+    asyncio.run(monitor.accepted_liveness_scan())
+    with SessionLocal() as db:
+        assert db.scalars(select(Task).where(Task.task_id == task_id)).first().status == "ACCEPTED"
+    assert _attempt_status(attempt_id) == "ACCEPTED"
+
+
+def test_running_attempt_not_converged_by_liveness_scan(client):
+    """Accept ≠ Running, but a RUNNING attempt is healthy: the scan (and its
+    CAS-on-ACCEPTED) must never close it."""
+    device = register_device(client, "活性机C")
+    task_id, attempt_id = _plant_attempt(
+        device["device_id"], task_status="ACCEPTED", attempt_status="RUNNING"
+    )
+    monitor = TaskMonitor(client.app.state.hub)
+    asyncio.run(monitor.accepted_liveness_scan())
+    with SessionLocal() as db:
+        assert db.scalars(select(Task).where(Task.task_id == task_id)).first().status == "ACCEPTED"
+    assert _attempt_status(attempt_id) == "RUNNING"
+
+
+# ------------------------------------------------- V1.6 P0 0.14 risk-aware retry
+
+
+def _plant_capability_task(device_id: str, risk_level: str) -> str:
+    """A FAILED CAPABILITY task whose capability carries the given risk."""
+    from app.capability_runtime.service import CapabilityService
+
+    suffix = uuid.uuid4().hex[:10]
+    with SessionLocal() as db:
+        cap = CapabilityService(db).create_capability(
+            f"fleet.auto.r{suffix}", "PYTHON", risk_level=risk_level
+        )
+        task = Task(
+            task_id=f"task_{suffix}",
+            name="retry-policy",
+            target_device_id=device_id,
+            status="FAILED",
+            execution_type="CAPABILITY",
+            capability_name=cap.name,
+            capability_version="1.0.0",
+            finished_at=utcnow(),
+        )
+        step = TaskStep(
+            step_id=f"step_{suffix}", task_id=task.task_id, command=cap.name,
+            status="FAILED", finished_at=utcnow(),
+        )
+        attempt = TaskAttempt(
+            attempt_id=f"attempt_{suffix}", task_id=task.task_id, step_id=step.step_id,
+            device_id=device_id, status="FAILED", finished_at=utcnow(),
+            error_code="ARTIFACT_CHECKSUM_MISMATCH",
+        )
+        db.add_all([task, step, attempt])
+        db.commit()
+    return f"task_{suffix}"
+
+
+def test_auto_retry_read_capability_after_data_plane_failure(client):
+    """§3.7: READ + checksum mismatch (re-downloadable) -> automatic new attempt."""
+    device = register_device(client, "重试策略机A")
+    task_id = _plant_capability_task(device["device_id"], "READ")
+    svc = TaskService(SessionLocal())
+    assert svc.maybe_auto_retry(task_id, error_code="ARTIFACT_CHECKSUM_MISMATCH") is True
+    with SessionLocal() as db:
+        assert db.scalars(select(Task).where(Task.task_id == task_id)).first().status == "PENDING"
+
+
+def test_auto_retry_never_blind_retries_write(client):
+    """§3.7: WRITE/ACTION never blind-retry - a worker retryable=true hint
+    cannot override the risk level."""
+    device = register_device(client, "重试策略机B")
+    task_id = _plant_capability_task(device["device_id"], "WRITE")
+    svc = TaskService(SessionLocal())
+    assert (
+        svc.maybe_auto_retry(task_id, error_code="ARTIFACT_CHECKSUM_MISMATCH", worker_retryable=True)
+        is False
+    )
+    with SessionLocal() as db:
+        assert db.scalars(select(Task).where(Task.task_id == task_id)).first().status == "FAILED"
+
+
+def test_auto_retry_requires_transient_failure_or_hint(client):
+    device = register_device(client, "重试策略机C")
+    task_id = _plant_capability_task(device["device_id"], "READ")
+    svc = TaskService(SessionLocal())
+    # a plain executor failure is not auto-retried
+    assert svc.maybe_auto_retry(task_id, error_code="CAPABILITY_EXECUTION_FAILED") is False
+    assert db_task_status(task_id) == "FAILED"
+    # the worker's explicit retryable hint unlocks it for READ
+    assert (
+        svc.maybe_auto_retry(task_id, error_code="CAPABILITY_EXECUTION_FAILED", worker_retryable=True)
+        is True
+    )
+    assert db_task_status(task_id) == "PENDING"
+
+
+def db_task_status(task_id: str) -> str:
+    with SessionLocal() as db:
+        return db.scalars(select(Task).where(Task.task_id == task_id)).first().status
+
+
 # ----------------------------------------------------------------- worker side
 
 

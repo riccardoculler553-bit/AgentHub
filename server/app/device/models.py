@@ -42,6 +42,8 @@ class DeviceOut(BaseModel):
     revoked_at: datetime | None
     connection_count: int = 0
     online: bool = False
+    # V1.6 P0 0.8: dual-axis state - scheduling is orthogonal to connectivity.
+    scheduling_state: str = "READY"
 
 
 class DeviceMessageIn(BaseModel):

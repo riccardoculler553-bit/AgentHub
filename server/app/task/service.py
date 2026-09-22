@@ -32,6 +32,16 @@ RETRYABLE_TASK_STATES = {"FAILED", "TIMEOUT"}
 # Backwards-compatible alias (state.py is the source of truth in V1.1).
 TERMINAL_TASK_STATES = TASK_TERMINAL_STATES
 
+# V1.6 P0 0.14 (§3.7): worker-reported failures eligible for automatic
+# re-dispatch of READ-risk capabilities - the data plane failed before or
+# during a read-only run, so re-running cannot double-apply a write.
+AUTO_RETRY_ERROR_CODES = {
+    "ARTIFACT_CHECKSUM_MISMATCH",  # re-download can fix corrupted bytes
+    "ARTIFACT_DOWNLOAD_FAILED",
+    "ARTIFACT_DOWNLOAD_STALLED",
+    "ARTIFACT_DOWNLOAD_TIMEOUT",
+}
+
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
@@ -197,6 +207,10 @@ class TaskService:
             execution_type="CAPABILITY",
             capability_name=capability.name,
             capability_version=payload.capability_version,
+            # V1.6 P0 0.13: pin package identity on the Task row at creation -
+            # dispatch envelopes may only echo these values, never re-resolve.
+            package_id=published.package_id,
+            package_checksum=published.checksum,
             artifact_ids=input_artifacts,
             timeout_seconds=payload.timeout_seconds,
             pending_since=utcnow(),
@@ -328,6 +342,9 @@ class TaskService:
 
         now = utcnow()
         advance = False
+        # V1.6 0.14: failure traits carried into the auto-retry policy.
+        worker_retryable = False
+        failure_error_code: str | None = None
 
         # --- stale gate (V1.1 §7/§8): report against an old attempt = audit only
         if attempt_id is not None and step.current_attempt_id != attempt_id:
@@ -444,6 +461,8 @@ class TaskService:
             else:  # failed
                 error_code = str(error.get("code", "EXECUTOR_FAILED"))[:64]
                 error_message = str(error.get("message", ""))[:500]
+                worker_retryable = bool(error.get("retryable"))
+                failure_error_code = error_code
                 if attempt is not None and can_transition("attempt", attempt.status, "FAILED"):
                     attempt.status = "FAILED"
                     attempt.finished_at = now
@@ -466,6 +485,12 @@ class TaskService:
             task_waiters.notify(task_id)
             # V1.3 §121: workflow advancement hooks the same terminal fact.
             notify_task_terminal(task_id)
+            # V1.6 P0 0.14: risk-aware auto retry AFTER the terminal fact is
+            # recorded and notified - the failure is real, the retry is policy.
+            if task.status == "FAILED":
+                self.maybe_auto_retry(
+                    task_id, error_code=failure_error_code, worker_retryable=worker_retryable
+                )
         return {"task_id": task_id, "advance": advance}
 
     def _apply_attempt_result(self, attempt: TaskAttempt | None, data: dict, now) -> bool:
@@ -593,6 +618,62 @@ class TaskService:
             self.db.commit()
         return {"task_id": task.task_id, "status": task.status, "notify_device": False}
 
+    def timeout_accepted_stalled(self, task: Task) -> dict:
+        """V1.6 P0 0.1 (audit H3): an attempt accepted but never running within
+        the liveness window is converged to TIMEOUT (ACCEPTED_STALLED) instead
+        of sitting until timeout_at. The worker enqueued the dispatch but never
+        started it - nothing executed, so closing is safe even for WRITE/ACTION
+        capabilities; retry re-enters PENDING normally.
+
+        CAS discipline: the task is closed only from ACCEPTED (a task that just
+        transitioned to RUNNING is left alone), and the attempt likewise."""
+        now = utcnow()
+        updated_task = (
+            self.db.query(Task)
+            .filter(Task.task_id == task.task_id, Task.status == "ACCEPTED")
+            .update({"status": "TIMEOUT", "finished_at": now}, synchronize_session=False)
+        )
+        attempt_id = step_id = None
+        if updated_task:
+            for step in self.get_steps(task.task_id):
+                open_attempt = self.latest_open_attempt(task.task_id, step.step_id)
+                if open_attempt is None or open_attempt.status != "ACCEPTED":
+                    continue
+                updated_attempt = (
+                    self.db.query(TaskAttempt)
+                    .filter(TaskAttempt.attempt_id == open_attempt.attempt_id,
+                            TaskAttempt.status == "ACCEPTED")
+                    .update(
+                        {
+                            "status": "TIMEOUT",
+                            "finished_at": now,
+                            "error_code": "ACCEPTED_STALLED",
+                            "error_message": (
+                                "worker accepted but never reported running "
+                                "within the liveness window"
+                            ),
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if updated_attempt:
+                    attempt_id, step_id = open_attempt.attempt_id, open_attempt.step_id
+                    break
+            self._record(
+                task.task_id, "task.timeout", step_id=step_id, attempt_id=attempt_id,
+                payload={"reason": "accepted_stalled"},
+            )
+        self.db.commit()
+        if updated_task:
+            notify_task_terminal(task.task_id)  # TIMEOUT is terminal
+        return {
+            "task_id": task.task_id,
+            "status": "TIMEOUT" if updated_task else task.status,
+            "notify_device": bool(updated_task),
+            "attempt_id": attempt_id,
+            "step_id": step_id,
+        }
+
     def _current_attempt_ids(self, task_id: str) -> tuple[str | None, str | None]:
         """(attempt_id, step_id) of the live attempt a cancel envelope should
         address (V1.1 §16: cancel is bound to the current attempt)."""
@@ -601,6 +682,66 @@ class TaskService:
             if open_attempt is not None and open_attempt.status in LIVE_ATTEMPT_STATES:
                 return open_attempt.attempt_id, step.step_id
         return None, None
+
+    # ------------------------------------------------------------- V1.6 0.14
+
+    def _capability_risk_level(self, task: Task) -> str | None:
+        """risk_level of the pinned capability (READ/WRITE/ACTION); None for
+        legacy commands (conservative: no auto-retry without a risk owner)."""
+        if task.execution_type != "CAPABILITY" or not task.capability_name:
+            return None
+        from app.capability_runtime.service import CapabilityService as RuntimeCapabilityService
+
+        row = RuntimeCapabilityService(self.db).get_capability(task.capability_name)
+        return row.risk_level if row is not None else None
+
+    def maybe_auto_retry(
+        self,
+        task_id: str,
+        *,
+        error_code: str | None = None,
+        worker_retryable: bool = False,
+        sent_unaccepted: bool = False,
+    ) -> bool:
+        """V1.6 P0 0.14 (§3.7): risk-aware automatic re-dispatch.
+
+        - READ capabilities may automatically enter a new attempt when the
+          failure is a transient data-plane error (AUTO_RETRY_ERROR_CODES),
+          the worker explicitly marked the failure retryable, or the task
+          died SENT-unaccepted on a flapping link (sent_unaccepted=True).
+        - WRITE/ACTION NEVER blind-retry: the write may already have landed
+          on the target; the operator decides (worker retryable=true cannot
+          override the risk level).
+        - max_attempts still bounds every retry (request_retry enforces).
+
+        Returns True when a new attempt was queued."""
+        import logging
+
+        task = self.get(task_id)
+        if task.status not in RETRYABLE_TASK_STATES:
+            return False
+        risk = self._capability_risk_level(task)
+        if risk != "READ":
+            return False
+        if not sent_unaccepted and error_code not in AUTO_RETRY_ERROR_CODES and not worker_retryable:
+            return False
+        try:
+            self.request_retry(task_id)
+        except Exception as exc:  # InvalidTaskState: attempts exhausted etc.
+            logging.getLogger(__name__).info("auto-retry declined for %s: %s", task_id, exc)
+            return False
+        self._record(
+            task_id, "task.auto_retried",
+            payload={
+                "error_code": error_code,
+                "worker_retryable": worker_retryable,
+                "sent_unaccepted": sent_unaccepted,
+                "risk_level": risk,
+            },
+        )
+        self.db.commit()
+        logging.getLogger(__name__).warning("READ task %s auto-retried (%s)", task_id, error_code or "sent_unaccepted")
+        return True
 
     def reconcile_terminal_attempts(self, resend_window_seconds: int) -> list[dict]:
         """Phase 2 reconciliation: an attempt may never outlive its task.

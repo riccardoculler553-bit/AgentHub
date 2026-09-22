@@ -25,6 +25,9 @@ _sender = None
 # notify_task_terminal 的多次触发（如 watchdog 与 result 竞态的另一侧）。
 _dedupe: set[tuple[str, str]] = set()
 _DEDUPE_CAP = 10000
+# V1.6 0.16: grace window for a still-running AgentRun to deliver the result
+# itself before the proactive sink pushes anyway.
+_RUN_GRACE_SECONDS = 120
 
 
 def install_agent_task_notifier(sender) -> None:
@@ -64,7 +67,21 @@ async def _notify(task_id: str) -> None:
             if run is None:
                 return  # not agent-initiated (API/workflow) - no channel to push
             if run.status not in ("SUCCESS", "FAILED", "CANCELLED"):
-                return  # agent still running: it will report the result itself
+                # V1.6 P0 0.16 (§3.8): AgentRun 终态不再决定要不要通知。the run
+                # is still mid-loop: if it is actively waiting on this task it
+                # delivers the result itself - give it a short grace window,
+                # then push anyway so a stuck/crashed run cannot silence the
+                # terminal fact. (Dedupe holds while we sleep.)
+                await asyncio.sleep(_RUN_GRACE_SECONDS)
+                run = db.scalars(
+                    select(AgentRun).where(AgentRun.id == run.id)
+                ).first()
+                if run is None:
+                    return
+                if run.status not in ("SUCCESS", "FAILED", "CANCELLED"):
+                    pass  # still running past the grace window -> push anyway
+                else:
+                    return  # the run wrapped up during the grace window
             key = (task_id, task.status)
             if key in _dedupe:
                 return

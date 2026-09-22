@@ -10,7 +10,7 @@ import pytest
 from app.db.database import SessionLocal
 from app.task.db_models import Task
 
-from ._worker import FakeWorker, register_device, wait_until
+from ._worker import FakeWorker, register_device, wait_for_worker_capabilities, wait_until
 from .test_workflow_run import _make_workflow, _run, _start_run, _wait_terminal
 
 CAP_NAME = "erp.order.export"
@@ -102,8 +102,12 @@ def test_capability_workflow_end_to_end_with_artifact(client, device):
     _publish_capability(client)
     worker = FakeWorker(
         client, device["device_token"], behaviour="success", capability_artifact=b"order export v1",
+        # V1.6 P0 0.10: the resolver only selects workers advertising the
+        # capability - the arbitrary-online fallback is gone.
+        installed_capabilities=[{"name": CAP_NAME, "version": CAP_VERSION}],
     )
     worker.start()
+    assert wait_for_worker_capabilities(client, device["device_id"], (CAP_NAME,))
     try:
         workflow_id = _make_workflow(
             client, device,
@@ -153,8 +157,12 @@ def test_capability_workflow_end_to_end_with_artifact(client, device):
 
 def test_capability_workflow_step_result_reaches_context(client, device):
     _publish_capability(client)
-    worker = FakeWorker(client, device["device_token"], behaviour="success")
+    worker = FakeWorker(
+        client, device["device_token"], behaviour="success",
+        installed_capabilities=[{"name": CAP_NAME, "version": CAP_VERSION}],
+    )
     worker.start()
+    assert wait_for_worker_capabilities(client, device["device_id"], (CAP_NAME,))
     try:
         workflow_id = _make_workflow(
             client, device,
@@ -172,8 +180,12 @@ def test_capability_workflow_step_result_reaches_context(client, device):
 
 def test_capability_workflow_failure_fails_run(client, device):
     _publish_capability(client)
-    worker = FakeWorker(client, device["device_token"], behaviour="fail")
+    worker = FakeWorker(
+        client, device["device_token"], behaviour="fail",
+        installed_capabilities=[{"name": CAP_NAME, "version": CAP_VERSION}],
+    )
     worker.start()
+    assert wait_for_worker_capabilities(client, device["device_id"], (CAP_NAME,))
     try:
         workflow_id = _make_workflow(
             client, device,

@@ -1,4 +1,4 @@
-﻿"""Persistent state models (MySQL is the authoritative state store).
+"""Persistent state models (MySQL is the authoritative state store).
 
 Realtime WebSocket state lives in the in-memory ConnectionHub, never here.
 """
@@ -24,6 +24,10 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(100), unique=True)
+    # V1.6 P0 0.18: single-tenant role - admin | operator | viewer.
+    # Enforcement for HTTP APIs is token-based (auth/rbac.py); this column
+    # records the identity's role for future login flows / audit.
+    role: Mapped[str] = mapped_column(String(16), default="admin")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 

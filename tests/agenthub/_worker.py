@@ -255,6 +255,25 @@ def wait_for_capabilities(
     return wait_until(ready, timeout)
 
 
+def wait_for_worker_capabilities(
+    client, device_id: str, names: tuple[str, ...], timeout: float = 10
+) -> bool:
+    """V1.6 P0 0.10: the resolver reads the NEW worker_capabilities plane and
+    ignores arbitrary-online fallbacks - tasks may only be created after the
+    installed-capability report is committed."""
+
+    def ready() -> bool:
+        for item in client.get("/api/worker-capabilities").json():
+            if item["worker_id"] != device_id:
+                continue
+            got = {c["name"] for c in item["capabilities"]}
+            if set(names) <= got:
+                return True
+        return False
+
+    return wait_until(ready, timeout)
+
+
 def wait_until(predicate, timeout: float = 12, interval: float = 0.3) -> bool:
     deadline = __import__("time").monotonic() + timeout
     while __import__("time").monotonic() < deadline:
