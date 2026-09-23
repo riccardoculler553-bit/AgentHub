@@ -14,6 +14,8 @@ Internet ──HTTPS/WSS──> 公网暴露层 ──> DeviceLink/AgentHub Serv
 
 详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
+**V1.6 范围：Fleet Execution & Operationalization（多设备执行与运行管理）。** 硬规则：一次用户请求 → 一次 Capability Execution → 一个 Task → 一台 Worker。SaaS 多租户、计费、MSP 配额、Job 扇出不在该版本内。范围与 `5022651` 审计见 [docs/v1.6-product-roadmap.md](docs/v1.6-product-roadmap.md)；P0 实现在其后的 Fleet-1.0，不在本文件。
+
 ## 网络模型（核心架构原则）
 
 > **Server 公网可达，Client 无需公网可达。**

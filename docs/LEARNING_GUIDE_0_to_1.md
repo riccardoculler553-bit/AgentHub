@@ -3,6 +3,7 @@
 > 编写日期：2026-09-19 · 对应代码：commit `1c5c0c6`（V1.5 Remote-Exec-1.0）
 > 用法：**按阶段顺序读，每个阶段末尾的自测题答得出来再进入下一阶段**。全程约 6–8 小时。
 > 本手册只做"导读与串联"，事实源永远是代码本身；文档与代码冲突时以代码为准（已知冲突见 §8）。
+> **V1.6 范围：** [v1.6-product-roadmap.md](v1.6-product-roadmap.md)（Fleet Execution & Operationalization：一次请求对应一次 Task / 一台 Worker。SaaS、Job 扇出、MSP 不在该版本内；长驻 Python 仅可选 P1）。审计冻结在 `5022651`。
 
 ---
 
