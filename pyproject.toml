@@ -2,6 +2,7 @@
 name = "devicelink"
 version = "1.0.0"
 description = "DeviceLink - multi-device WebSocket registration and connection management platform (V1.0)"
+license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.110",
