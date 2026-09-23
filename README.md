@@ -141,3 +141,9 @@ python -m pytest tests -q
 ## V1.0 之后
 
 跨设备多步工作流（`task_steps.device_id` 已预留）→ Worker 并发与断线补报 → 事件驱动派发 → 对话式多轮 Agent。
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Riccardo Culler and contributors.
+
+How to send a change: [CONTRIBUTING.md](CONTRIBUTING.md).
